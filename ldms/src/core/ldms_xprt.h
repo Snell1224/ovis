@@ -265,7 +265,7 @@ struct ldms_rendezvous_msg {
 struct ldms_dir_reply {
 	uint32_t type;
 	uint32_t more;
-	uint32_t json_data_len;
+	uint32_t json_data_len; /* This is not used but left for compatibility with V4.3.3 */
 	char json_data[OVIS_FLEX];
 };
 
@@ -429,8 +429,8 @@ struct ldms_xprt {
 
 	/* for addr caching */
 	socklen_t sa_len;
-	struct sockaddr local_sa;
-	struct sockaddr remote_sa;
+	struct sockaddr_storage local_sa;
+	struct sockaddr_storage remote_sa;
 };
 
 void __ldms_xprt_term(struct ldms_xprt *x);

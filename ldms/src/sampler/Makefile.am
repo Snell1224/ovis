@@ -17,9 +17,6 @@ libsampler_base_la_SOURCES = sampler_base.c sampler_base.h
 libsampler_base_la_LIBADD = $(CORE_LIBADD)
 lib_LTLIBRARIES += libsampler_base.la
 
-PAPI_LDFLAGS = @LIBPAPI_LIB64DIR_FLAG@ @LIBPAPI_LIBDIR_FLAG@ \
-             @LIBPFM_LIB64DIR_FLAG@ @LIBPFM_LIBDIR_FLAG@
-
 ldmssamplerincludedir = $(includedir)/ldms/sampler
 ldmssamplerinclude_HEADERS = sampler_base.h
 
@@ -99,24 +96,16 @@ if ENABLE_JOBINFO
 SUBDIRS += job_info
 endif
 
-if ENABLE_SLURM_JOBINFO
+if HAVE_SLURM
 SUBDIRS += job_info_slurm
+SUBDIRS += spank
 endif
+
+# This slurm sampler does not have a slurm build dependency
+SUBDIRS += slurm
 
 if ENABLE_LUSTRE
 SUBDIRS += lustre
-endif
-
-if ENABLE_PAPI_SAMPLER
-SUBDIRS += papi
-endif
-
-if ENABLE_SLURM_SAMPLER
-SUBDIRS += slurm
-endif
-
-if ENABLE_SPANK_PLUGIN
-SUBDIRS += spank
 endif
 
 if ENABLE_IBM_OCC_SAMPLER
@@ -171,14 +160,6 @@ libperfevent_la_LIBADD = $(COMMON_LIBADD) -lm
 pkglib_LTLIBRARIES += libperfevent.la
 endif
 
-if ENABLE_HWEVENTPAPI
-libhweventpapi_la_SOURCES = hweventpapi.c
-libhweventpapi_la_CFLAGS = $(AM_CFLAGS) $(LIBPAPI_INCDIR_FLAG)
-libhweventpapi_la_LDFLAGS = $(AM_LDFLAGS) $(PAPI_LDFLAGS)
-libhweventpapi_la_LIBADD = $(COMMON_LIBADD) $(JOBID_LIBFLAGS) -lpapi -lpfm -lm
-pkglib_LTLIBRARIES += libhweventpapi.la
-endif
-
 if ENABLE_APPINFO
 libappinfo_la_SOURCES = appinfo.c
 libappinfo_la_CFLAGS = $(AM_CFLAGS) -I$(srcdir)/appinfo_lib
@@ -191,12 +172,23 @@ if ENABLE_MPI_SAMPLER
 SUBDIRS += shm
 endif
 
-if ENABLE_RAPL
+if HAVE_LIBPAPI
+SUBDIRS += papi
+if HAVE_LIBPFM
+SUBDIRS += syspapi
+
+libhweventpapi_la_SOURCES = hweventpapi.c
+libhweventpapi_la_CFLAGS = $(AM_CFLAGS)
+libhweventpapi_la_LDFLAGS = $(AM_LDFLAGS)
+libhweventpapi_la_LIBADD = $(COMMON_LIBADD) $(JOBID_LIBFLAGS) $(LTLIBPAPI) $(LTLIBPFM) -lm
+pkglib_LTLIBRARIES += libhweventpapi.la
+
 librapl_la_SOURCES = rapl.c
-librapl_la_CFLAGS = $(AM_CFLAGS) $(LIBPAPI_INCDIR_FLAG)
+librapl_la_CFLAGS = $(AM_CFLAGS)
 librapl_la_LDFLAGS = $(AM_LDFLAGS) $(PAPI_LDFLAGS)
-librapl_la_LIBADD = $(COMMON_LIBADD) -lpapi -lpfm -lm
+librapl_la_LIBADD = $(COMMON_LIBADD) $(LTLIBPAPI) $(LTLIBPFM) -lm
 pkglib_LTLIBRARIES += librapl.la
+endif
 endif
 
 if ENABLE_PROCDISKSTATS
@@ -265,10 +257,6 @@ if ENABLE_GRPTEST_LDMS_TEST
 libgrptest_la_SOURCES = grptest.c
 libgrptest_la_LIBADD = $(COMMON_LIBADD)
 pkglib_LTLIBRARIES += libgrptest.la
-endif
-
-if ENABLE_SYSPAPI_SAMPLER
-SUBDIRS += syspapi
 endif
 
 if ENABLE_APP_SAMPLER

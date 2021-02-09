@@ -46,7 +46,7 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
+#define _GNU_SOURCE
 #include <sys/errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -129,17 +129,6 @@ static pthread_mutex_t z_key_tree_mutex;
 
 static LIST_HEAD(, z_sock_ep) z_sock_list = LIST_HEAD_INITIALIZER(0);
 static pthread_mutex_t z_sock_list_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static int __set_sockbuf_sz(int sockfd)
-{
-	int rc;
-	size_t optval = SOCKBUF_SZ;
-	rc = setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &optval, sizeof(optval));
-	if (rc)
-		return rc;
-	rc = setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &optval, sizeof(optval));
-	return rc;
-}
 
 static int z_rbn_cmp(void *a, const void *b)
 {
@@ -302,32 +291,55 @@ static zap_err_t z_get_name(zap_ep_t ep, struct sockaddr *local_sa,
 	return zap_errno2zerr(errno);
 }
 
-static int __set_keep_alive(struct z_sock_ep *sep)
+static int __set_sock_opts(struct z_sock_ep *sep)
 {
 	int rc;
-	int optval = 1;
-	rc = setsockopt(sep->sock, SOL_SOCKET, SO_KEEPALIVE, &optval,
+	int i;
+	size_t sz;
+
+	/* nonblock */
+	rc = __sock_nonblock(sep->sock);
+	if (rc)
+		return rc;
+
+	/* keepalive */
+	i = 1;
+	rc = setsockopt(sep->sock, SOL_SOCKET, SO_KEEPALIVE, &i,
 			sizeof(int));
 	if (rc) {
 		LOG_(sep, "zap_sock: WARNING: set SO_KEEPALIVE error: %d\n", errno);
 		return errno;
 	}
-	optval = ZAP_SOCK_KEEPCNT;
-	rc = setsockopt(sep->sock, SOL_TCP, TCP_KEEPCNT, &optval, sizeof(int));
+	i = ZAP_SOCK_KEEPCNT;
+	rc = setsockopt(sep->sock, SOL_TCP, TCP_KEEPCNT, &i, sizeof(int));
 	if (rc) {
 		LOG_(sep, "zap_sock: WARNING: set TCP_KEEPCNT error: %d\n", errno);
 		return errno;
 	}
-	optval = ZAP_SOCK_KEEPIDLE;
-	rc = setsockopt(sep->sock, SOL_TCP, TCP_KEEPIDLE, &optval, sizeof(int));
+	i = ZAP_SOCK_KEEPIDLE;
+	rc = setsockopt(sep->sock, SOL_TCP, TCP_KEEPIDLE, &i, sizeof(int));
 	if (rc) {
 		LOG_(sep, "zap_sock: WARNING: set TCP_KEEPIDLE error: %d\n", errno);
 		return errno;
 	}
-	optval = ZAP_SOCK_KEEPINTVL;
-	rc = setsockopt(sep->sock, SOL_TCP, TCP_KEEPINTVL, &optval, sizeof(int));
+	i = ZAP_SOCK_KEEPINTVL;
+	rc = setsockopt(sep->sock, SOL_TCP, TCP_KEEPINTVL, &i, sizeof(int));
 	if (rc) {
 		LOG_(sep, "zap_sock: WARNING: set TCP_KEEPINTVL error: %d\n", errno);
+		return errno;
+	}
+
+	/* send/recv bufsiz */
+	sz = SOCKBUF_SZ;
+	rc = setsockopt(sep->sock, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+	if (rc) {
+		LOG_(sep, "zap_sock: WARNING: set SO_SNDBUF error: %d\n", errno);
+		return errno;
+	}
+	sz = SOCKBUF_SZ;
+	rc = setsockopt(sep->sock, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+	if (rc) {
+		LOG_(sep, "zap_sock: WARNING: set SO_RCVBUF error: %d\n", errno);
 		return errno;
 	}
 	return 0;
@@ -350,20 +362,10 @@ static zap_err_t z_sock_connect(zap_ep_t ep,
 		goto err1;
 	}
 
-	rc = __set_sockbuf_sz(sep->sock);
-	if (rc) {
+	rc = __set_sock_opts(sep);
+	if (rc)  {
 		zerr = ZAP_ERR_TRANSPORT;
 		goto err1;
-	}
-
-	rc = __sock_nonblock(sep->sock);
-	if (rc) {
-		zerr = ZAP_ERR_RESOURCE;
-		goto err1;
-	}
-	rc = __set_keep_alive(sep);
-	if (rc) {
-		LOG_(sep, "zap_sock: WARNING: __set_keep_alive() rc: %d\n", rc);
 	}
 
 	if (data_len) {
@@ -575,6 +577,8 @@ static void process_sep_msg_read_req(struct z_sock_ep *sep)
 	uint32_t data_len;
 	char *src;
 	struct sock_msg_read_resp rmsg;
+	memset(&(rmsg.status), 0, sizeof(rmsg.status));
+	rmsg.dst_ptr = 0;
 
 	msg = sep->buff.data;
 
@@ -859,6 +863,8 @@ static int __recv_msg(struct z_sock_ep *sep)
 			goto err;
 		}
 		if (rsz < 0) {
+			if (errno == EAGAIN)
+				return errno;
 			/* error */
 			rc = errno;
 			from_line = __LINE__;
@@ -909,6 +915,8 @@ static int __recv_msg(struct z_sock_ep *sep)
 			goto err;
 		}
 		if (rsz < 0) {
+			if (errno == EAGAIN)
+				return errno;
 			rc = errno;
 			from_line = __LINE__;
 			goto err;
@@ -1068,6 +1076,8 @@ static process_sep_msg_fn_t process_sep_msg_fns[SOCK_MSG_TYPE_LAST] = {
 
 static zap_err_t __sock_send_connect(struct z_sock_ep *sep, char *buf, size_t len);
 
+static zap_thrstat_t sock_stats;
+
 /*
  * This is the callback function for connecting/connected endpoints.
  *
@@ -1080,6 +1090,7 @@ static void sock_ev_cb(ovis_event_t ev)
 {
 	struct z_sock_ep *sep = ev->param.ctxt;
 
+	zap_thrstat_wait_end(sock_stats);
 	zap_get_ep(&sep->ep);
 	DEBUG_LOG(sep, "ep: %p, sock_ev_cb() -- BEGIN --\n", sep);
 
@@ -1087,8 +1098,8 @@ static void sock_ev_cb(ovis_event_t ev)
 	if (ev->cb.epoll_events & EPOLLOUT) {
 		pthread_mutex_lock(&sep->ep.lock);
 		if (sep->sock_connected) {
-			pthread_mutex_unlock(&sep->ep.lock);
 			sock_write(ev);
+			pthread_mutex_unlock(&sep->ep.lock);
 		} else if (sep->ep.state == ZAP_EP_CONNECTING) {
 			sep->sock_connected = 1;
 			pthread_mutex_unlock(&sep->ep.lock);
@@ -1121,6 +1132,7 @@ static void sock_ev_cb(ovis_event_t ev)
  out:
 	DEBUG_LOG(sep, "ep: %p, sock_ev_cb() -- END --\n", sep);
 	zap_put_ep(&sep->ep);
+	zap_thrstat_wait_start(sock_stats);
 }
 
 static void sock_connect(ovis_event_t ev)
@@ -1147,7 +1159,6 @@ static void sock_write(ovis_event_t ev)
 	ssize_t wsz;
 	z_sock_send_wr_t wr;
 
-	pthread_mutex_lock(&sep->ep.lock);
  next:
 	wr = TAILQ_FIRST(&sep->sq);
 	if (!wr) {
@@ -1157,54 +1168,53 @@ static void sock_write(ovis_event_t ev)
 	}
 
 	/* msg */
-	if (wr->msg_len) {
-		wsz = write(sep->sock, wr->msg + wr->off, wr->msg_len);
+	while (wr->msg_len) {
+		wsz = send(sep->sock, wr->msg + wr->off, wr->msg_len, MSG_NOSIGNAL);
 		if (wsz < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				__enable_epoll_out(sep);
 				goto out;
-			/* bad error */
+			}
+			/* otherwise, bad error */
 			goto err;
 		}
 		DEBUG_LOG(sep, "ep: %p, wrote %ld bytes\n", sep, wsz);
-		if (wsz < wr->msg_len) {
-			wr->msg_len -= wsz;
+		wr->msg_len -= wsz;
+		if (!wr->msg_len)
+			wr->off = 0; /* reset off for data */
+		else
 			wr->off += wsz;
-			goto out;
-		}
-		wr->msg_len = 0;
-		wr->off = 0;
 	}
 
-	if (wr->data_len) {
-		wsz = write(sep->sock, wr->data + wr->off, wr->data_len);
+	/* data, wr->msg_len is already 0 */
+	assert(wr->msg_len == 0);
+	while (wr->data_len) {
+		wsz = send(sep->sock, wr->data + wr->off, wr->data_len, MSG_NOSIGNAL);
 		if (wsz < 0) {
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				__enable_epoll_out(sep);
 				goto out;
-			/* bad error */
+			}
+			/* otherwise bad error */
 			goto err;
 		}
 		DEBUG_LOG(sep, "ep: %p, wrote %ld bytes\n", sep, wsz);
-		if (wsz < wr->data_len) {
-			wr->data_len -= wsz;
-			wr->off += wsz;
-			goto out;
-		}
-		wr->data_len = 0;
-		wr->off = 0;
+		wr->data_len -= wsz;
+		wr->off += wsz;
 	}
 
 	/* reaching here means wr->data_len and wr->msg_len are 0 */
+	assert(0 == wr->data_len);
+	assert(0 == wr->msg_len);
 	TAILQ_REMOVE(&sep->sq, wr, link);
 	free(wr);
 	goto next;
 
  out:
-	pthread_mutex_unlock(&sep->ep.lock);
 	return;
 
  err:
 	shutdown(sep->sock, SHUT_RDWR);
-	pthread_mutex_unlock(&sep->ep.lock);
 }
 
 #define min_t(t, x, y) (t)((t)x < (t)y?(t)x:(t)y)
@@ -1301,6 +1311,7 @@ static void *io_thread_proc(void *arg)
 	sigfillset(&sigset);
 	rc = sigprocmask(SIG_SETMASK, &sigset, NULL);
 	assert(rc == 0 && "pthread_sigmask error");
+	zap_thrstat_wait_start(sock_stats);
 	rc = ovis_scheduler_loop(sched, 0);
 	return NULL;
 }
@@ -1403,8 +1414,8 @@ static zap_err_t __sock_send_msg_nolock(struct z_sock_ep *sep,
 		memcpy(wr->msg + msg_size, data, data_len);
 	}
 	TAILQ_INSERT_TAIL(&sep->sq, wr, link);
-	if (__enable_epoll_out(sep))
-		return ZAP_ERR_RESOURCE;
+	struct ovis_event_s ev = { .param = { .ctxt = sep } };
+	sock_write(&ev);
 	return ZAP_ERR_OK;
 }
 
@@ -1462,7 +1473,7 @@ static void sock_event(ovis_event_t ev)
 		sep->ep.state = ZAP_EP_ERROR;
 		if (sep->app_accepted) {
 			zev.type = ZAP_EVENT_CONNECT_ERROR;
-			do_cb = drop_conn_ref = 1;
+			do_cb = 1;
 		}
 		break;
 	case ZAP_EP_CONNECTING:
@@ -1517,26 +1528,13 @@ static void __z_sock_conn_request(ovis_event_t ev)
 		return;
 	}
 
-	rc = __set_sockbuf_sz(sockfd);
-	if (rc) {
-		close(sockfd);
-		return;
-	}
-
-	rc = __sock_nonblock(sockfd);
-	if (rc) {
-		close(sockfd);
-		return;
-	}
-
 	new_ep = zap_new(sep->ep.z, sep->ep.app_cb);
 	if (!new_ep) {
 		zerr = errno;
 		LOG_(sep, "Zap Error %d (%s): in %s at %s:%d\n",
 				zerr, zap_err_str(zerr) , __func__, __FILE__,
 				__LINE__);
-		close(sockfd);
-		return;
+		goto err_0;
 	}
 
 	void *uctxt = zap_get_ucontext(&sep->ep);
@@ -1553,15 +1551,25 @@ static void __z_sock_conn_request(ovis_event_t ev)
 	new_sep->ev.param.epoll_events = EPOLLIN;
 	new_sep->ev.param.fd = sockfd;
 
+	rc = __set_sock_opts(new_sep);
+	if (rc)
+		goto err_1;
+
 	rc = ovis_scheduler_event_add(sched, &new_sep->ev);
 	if (rc) {
 		/* synchronous error & app doesn't know about this new
 		 * endpoint yet ... so just log and cleanup. */
 		LOG_(sep, "ovis_scheduler_event_add() error %d on fd %d", rc,
 					new_sep->sock);
-		free(new_ep);
-		close(sockfd);
+		goto err_1;
 	}
+
+	return;
+
+ err_1:
+	free(new_ep);
+ err_0:
+	close(sockfd);
 }
 
 static zap_err_t z_sock_listen(zap_ep_t ep, struct sockaddr *sa,
@@ -1652,6 +1660,8 @@ static int init_once()
 {
 	int rc = ENOMEM;
 
+	sock_stats = zap_thrstat_new("sock:io_proc", ZAP_ENV_INT(ZAP_THRSTAT_WINDOW));
+	assert(sock_stats);
 	sched = ovis_scheduler_new();
 	if (!sched)
 		return errno;
@@ -1659,7 +1669,7 @@ static int init_once()
 	rc = pthread_create(&io_thread, NULL, io_thread_proc, 0);
 	if (rc)
 		goto err_1;
-
+	pthread_setname_np(io_thread, "sock:io_proc");
 	init_complete = 1;
 
 	z_key_tree.root = NULL;
@@ -1892,17 +1902,18 @@ static zap_err_t z_sock_read(zap_ep_t ep, zap_map_t src_map, char *src,
 		goto err;
 	}
 
+	TAILQ_INSERT_TAIL(&sep->io_q, io, q_link);
 	/* write message */
 	zerr = __sock_send_msg_nolock(sep, &io->read.hdr, sizeof(io->read),
 				      NULL, 0);
 	if (zerr)
 		goto err1;
 
-	TAILQ_INSERT_TAIL(&sep->io_q, io, q_link);
 	pthread_mutex_unlock(&sep->ep.lock);
 	zerr = ZAP_ERR_OK;
 	return zerr;
 err1:
+	TAILQ_REMOVE(&sep->io_q, io, q_link);
 	pthread_mutex_unlock(&sep->ep.lock);
 err:
 	__sock_io_free(sep, io);
@@ -1947,17 +1958,18 @@ static zap_err_t z_sock_write(zap_ep_t ep, zap_map_t src_map, char *src,
 		goto err1;
 	}
 
+	TAILQ_INSERT_TAIL(&sep->io_q, io, q_link);
 	/* write message */
 	zerr = __sock_send_msg_nolock(sep, &io->write.hdr, sizeof(io->write),
 				      src, sz);
-	if (zerr) {
-		goto err1;
-	}
+	if (zerr)
+		goto err2;
 
-	TAILQ_INSERT_TAIL(&sep->io_q, io, q_link);
 	pthread_mutex_unlock(&sep->ep.lock);
 	return ZAP_ERR_OK;
 
+err2:
+	TAILQ_REMOVE(&sep->io_q, io, q_link);
 err1:
 	pthread_mutex_unlock(&sep->ep.lock);
 err0:

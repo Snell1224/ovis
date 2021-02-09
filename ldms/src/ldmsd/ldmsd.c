@@ -47,6 +47,8 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#define _GNU_SOURCE
+
 #include <unistd.h>
 #include <inttypes.h>
 #include <stdarg.h>
@@ -276,15 +278,6 @@ LDMSD_LOG_AT(LDMSD_LWARNING,warning);
 LDMSD_LOG_AT(LDMSD_LERROR,error);
 LDMSD_LOG_AT(LDMSD_LCRITICAL,critical);
 LDMSD_LOG_AT(LDMSD_LALL,all);
-
-static char msg_buf[4096];
-void ldmsd_msg_logger(enum ldmsd_loglevel level, const char *fmt, ...)
-{
-	va_list ap;
-	va_start(ap, fmt);
-	vsnprintf(msg_buf, sizeof(msg_buf), fmt, ap);
-	ldmsd_log(level, "%s", msg_buf);
-}
 
 enum ldmsd_loglevel ldmsd_str_to_loglevel(const char *level_s)
 {
@@ -611,7 +604,7 @@ void kpublish(int map_fd, int set_no, int set_size, char *set_name)
 		return;
 	}
 	sh = meta_addr;
-	sprintf(sh->producer_name, "%s", myhostname);
+	snprintf(sh->producer_name, sizeof(sh->producer_name), "%.63s", myhostname);
 }
 
 pthread_t k_thread;
@@ -843,7 +836,7 @@ free_set:
 
 void ldmsd_set_deregister(const char *inst_name, const char *plugin_name)
 {
-	ldmsd_plugin_set_t set;
+	ldmsd_plugin_set_t set = NULL;
 	ldmsd_plugin_set_list_t list;
 	struct rbn *rbn;
 	ldmsd_set_tree_lock();
@@ -852,13 +845,15 @@ void ldmsd_set_deregister(const char *inst_name, const char *plugin_name)
 		goto out;
 	list = container_of(rbn, struct ldmsd_plugin_set_list, rbn);
 	LIST_FOREACH(set, &list->list, entry) {
-		if (0 == strcmp(set->inst_name, inst_name)) {
-			LIST_REMOVE(set, entry);
-			free(set->inst_name);
-			free(set->plugin_name);
-			ldms_set_put(set->set);
-			free(set);
-		}
+		if (0 == strcmp(set->inst_name, inst_name))
+			break;
+	}
+	if (set) {
+		LIST_REMOVE(set, entry);
+		free(set->inst_name);
+		free(set->plugin_name);
+		ldms_set_put(set->set);
+		free(set);
 	}
 	if (LIST_EMPTY(&list->list)) {
 		rbt_del(&set_tree, &list->rbn);
@@ -1518,18 +1513,16 @@ void ldmsd_listen___del(ldmsd_cfgobj_t obj)
 ldmsd_listen_t ldmsd_listen_new(char *xprt, char *port, char *host, char *auth)
 {
 	char *name;
-	size_t len;
+	int len;
 	struct ldmsd_listen *listen = NULL;
 	ldmsd_auth_t auth_dom = NULL;
 
 	if (!port)
 		port = LDMSD_STR_WRAP(LDMS_DEFAULT_PORT);
 
-	len = strlen(xprt) + strlen(port) + 2; /* +1 for ':' and +1 for \0 */
-	name = malloc(len);
-	if (!name)
+	len = asprintf(&name, "%s:%s:%s", xprt, port, host?host:"");
+	if (len < 0)
 		return NULL;
-	(void) snprintf(name, len, "%s:%s", xprt, port);
 	listen = (struct ldmsd_listen *)
 		ldmsd_cfgobj_new_with_auth(name, LDMSD_CFGOBJ_LISTEN,
 				sizeof *listen, ldmsd_listen___del,
@@ -1575,6 +1568,33 @@ err:
 	ldmsd_cfgobj_unlock(&listen->obj);
 	ldmsd_cfgobj_put(&listen->obj);
 	return NULL;
+}
+
+int ldmsd_listen_start(ldmsd_listen_t listen)
+{
+	int rc = 0;
+	assert(NULL == listen->x);
+	listen->x = ldms_xprt_new_with_auth(listen->xprt, ldmsd_linfo,
+				listen->auth_name, listen->auth_attrs);
+		if (!listen->x) {
+			rc = errno;
+			char *args = av_to_string(listen->auth_attrs, AV_EXPAND);
+			ldmsd_log(LDMSD_LERROR,
+				  "'%s' transport creation with auth '%s' "
+				  "failed, error: %s(%d). args='%s'. Please check transport "
+				  "configuration, authentication configuration, "
+				  "ZAP_LIBPATH (env var), and LD_LIBRARY_PATH.\n",
+				  listen->xprt,
+				  listen->auth_name,
+				  ovis_errno_abbvr(rc),
+				  rc, args ? args : "(empty conf=)");
+			free(args);
+			goto out;
+		}
+
+	rc = listen_on_ldms_xprt(listen);
+ out:
+	return rc;
 }
 
 static int __create_default_auth()
@@ -2131,23 +2151,9 @@ int main(int argc, char *argv[])
 	ldmsd_listen_t listen;
 	for (listen = (ldmsd_listen_t)ldmsd_cfgobj_first(LDMSD_CFGOBJ_LISTEN);
 		listen; listen = (ldmsd_listen_t)ldmsd_cfgobj_next(&listen->obj)) {
-		listen->x = ldms_xprt_new_with_auth(listen->xprt, ldmsd_linfo,
-			listen->auth_name, listen->auth_attrs);
-		if (!listen->x) {
-			ldmsd_log(LDMSD_LERROR,
-				  "'%s' transport creation with auth '%s' "
-				  "failed, error: %s(%d). Please check transpot "
-				  "configuration, authentication configuration, "
-				  "ZAP_LIBPATH (env var), and LD_LIBRARY_PATH.\n",
-				  listen->xprt,
-				  listen->auth_name,
-				  ovis_errno_abbvr(errno),
-				  errno);
-			cleanup(6, "error creating transport");
-		}
-		int rc = listen_on_ldms_xprt(listen);
-		if (rc)
-			cleanup(rc, "error listening on transport");
+		ret = ldmsd_listen_start(listen);
+		if (ret)
+			cleanup(7, "error listening on transport");
 	}
 
 	if (ldmsd_use_failover) {

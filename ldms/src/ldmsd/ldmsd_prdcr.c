@@ -222,6 +222,7 @@ static void prdcr_reset_set(ldmsd_prdcr_t prdcr, ldmsd_prdcr_set_t prd_set)
 	prdcr_hint_tree_update(prdcr, prd_set,
 			       &prd_set->updt_hint, UPDT_HINT_TREE_REMOVE);
 	rbt_del(&prdcr->set_tree, &prd_set->rbn);
+	ldmsd_prdcr_set_ref_put(prd_set);	/* set_tree reference */
 	prdcr_set_del(prd_set);
 }
 
@@ -343,6 +344,16 @@ static void _add_cb(ldms_t xprt, ldmsd_prdcr_t prdcr, ldms_dir_set_t dset)
 	/* Check to see if it's already there */
 	set = _find_set(prdcr, dset->inst_name);
 	if (!set) {
+		/* See if the ldms set is already there */
+		ldms_set_t xs = ldms_xprt_set_by_name(xprt, dset->inst_name);
+		if (xs) {
+			ldmsd_log(LDMSD_LCRITICAL, "Received dir_add, prdset is missing, but set %s is present...ignoring",
+					dset->inst_name);
+			return;
+			ldmsd_prdcr_set_ref_get(set); /* dropped in prdset_lookup_cb() */
+			__ldmsd_prdset_lookup_cb(xprt, 0, 0, xs, set);
+			ref_put(&xs->ref, "ldms_xprt_set_by_name");
+		}
 		set = prdcr_set_new(dset->inst_name, dset->schema_name);
 		if (!set) {
 			ldmsd_log(LDMSD_LERROR, "Memory allocation failure in %s "
@@ -351,15 +362,8 @@ static void _add_cb(ldms_t xprt, ldmsd_prdcr_t prdcr, ldms_dir_set_t dset)
 			return;
 		}
 		set->prdcr = prdcr;
+		ldmsd_prdcr_set_ref_get(set); 	/* set_tree reference */
 		rbt_ins(&prdcr->set_tree, &set->rbn);
-		/* See if the ldms set is already there */
-		ldms_set_t xs = ldms_xprt_set_by_name(xprt, dset->inst_name);
-		if (xs) {
-			assert(0 == "this should not happen");
-			ldmsd_prdcr_set_ref_get(set); /* dropped in prdset_lookup_cb() */
-			__ldmsd_prdset_lookup_cb(xprt, 0, 0, xs, set);
-			ref_put(&xs->ref, "ldms_xprt_set_by_name");
-		}
 	} else {
 		ldmsd_log(LDMSD_LCRITICAL, "Received a dir_add update for "
 			  "'%s', prdcr_set still present with refcount %d, and set "
@@ -513,6 +517,7 @@ static int __prdcr_subscribe(ldmsd_prdcr_t prdcr)
 
 static void __prdcr_remote_set_delete(ldmsd_prdcr_t prdcr, ldms_set_t set)
 {
+	const char *state_str = "bad_state";
 	ldmsd_prdcr_set_t prdcr_set;
 	if (!set)
 		return;
@@ -521,26 +526,24 @@ static void __prdcr_remote_set_delete(ldmsd_prdcr_t prdcr, ldms_set_t set)
 	assert(prdcr_set->ref_count);
 	switch (prdcr_set->state) {
 	case LDMSD_PRDCR_SET_STATE_START:
-		ldmsd_log(LDMSD_LERROR,
-			  "Deleting %s in the START state\n",
-			  prdcr_set->inst_name);
+		state_str = "START";
 		break;
 	case LDMSD_PRDCR_SET_STATE_LOOKUP:
-		ldmsd_log(LDMSD_LERROR,
-			  "Deleting %s in the LOOKUP state\n",
-			  prdcr_set->inst_name);
+		state_str = "LOOKUP";
 		break;
 	case LDMSD_PRDCR_SET_STATE_READY:
-		ldmsd_log(LDMSD_LERROR,
-			  "Deleting %s in the READY state\n",
-			  prdcr_set->inst_name);
+		state_str = "READY";
 		break;
 	case LDMSD_PRDCR_SET_STATE_UPDATING:
-		ldmsd_log(LDMSD_LERROR,
-			  "Deleting %s in the UPDATING state\n",
-			  prdcr_set->inst_name);
+		state_str = "UPDATING";
+		break;
+	case LDMSD_PRDCR_SET_STATE_DELETED:
+		state_str = "DELETING";
 		break;
 	}
+	ldmsd_log(LDMSD_LINFO,
+			"Deleting %s in the %s state\n",
+			prdcr_set->inst_name, state_str);
 	pthread_mutex_unlock(&prdcr_set->lock);
 	prdcr_reset_set(prdcr, prdcr_set);
 }
@@ -937,16 +940,16 @@ int ldmsd_prdcr_subscribe(ldmsd_prdcr_t prdcr, const char *stream)
 	LIST_FOREACH(s, &prdcr->stream_list, entry) {
 		if (0 == strcmp(s->name, stream)) {
 			rc = EEXIST;
-			goto err;
+			goto err_0;
 		}
 	}
 	rc = ENOMEM;
 	s = calloc(1, sizeof *s);
 	if (!s)
-		goto err;
+		goto err_0;
 	s->name = strdup(stream);
 	if (!s->name)
-		goto err;
+		goto err_1;
 	LIST_INSERT_HEAD(&prdcr->stream_list, s, entry);
 	if (prdcr->conn_state == LDMSD_PRDCR_STATE_CONNECTED) {
 		/* issue stream subscribe request right away if connected */
@@ -964,10 +967,11 @@ int ldmsd_prdcr_subscribe(ldmsd_prdcr_t prdcr, const char *stream)
 	}
 	ldmsd_prdcr_unlock(prdcr);
 	return 0;
- err:
-	ldmsd_prdcr_unlock(prdcr);
+ err_1:
 	if (s)
 		free(s);
+ err_0:
+	ldmsd_prdcr_unlock(prdcr);
 	return rc;
 
  rcmd_err:

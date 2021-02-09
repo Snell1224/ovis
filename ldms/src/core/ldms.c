@@ -83,7 +83,8 @@ const char *ldms_xprt_op_names[] = {
 	"UPDATE",
 	"PUBLISH",
 	"SET_DELETE",
-	"DIR",
+	"DIR_REQ",
+	"DIR_REP",
 	"SEND"
 };
 
@@ -138,6 +139,16 @@ static struct rbt del_tree = {
 	.root = NULL,
 	.comparator = id_comparator
 };
+
+int ldms_set_count()
+{
+	return __set_tree.card;
+}
+
+int ldms_set_deleting_count()
+{
+	return del_tree.card;
+}
 
 static pthread_mutex_t __del_tree_lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -691,9 +702,7 @@ static void __destroy_set(void *v)
 
 static void __set_delete_cb(ldms_t xprt, int status, ldms_set_t rbd, void *cb_arg)
 {
-	struct ldms_set *set = cb_arg;
-	ref_put(&set->ref, "share_lookup");
-	ref_put(&rbd->ref, "share_lookup");
+	__put_share_lookup_ref(rbd);
 }
 
 void ldms_set_delete(ldms_set_t s)

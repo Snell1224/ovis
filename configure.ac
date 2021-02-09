@@ -8,6 +8,7 @@ AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_SRCDIR([m4/Ovis-top.m4])
 AC_CONFIG_AUX_DIR(config)
 AM_CONFIG_HEADER(config.h)
+AC_REQUIRE_AUX_FILE([tap-driver.sh])
 AC_PROG_CC
 AM_INIT_AUTOMAKE([foreign tar-pax])
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
@@ -136,8 +137,13 @@ if test "$disable_zap" != "yes"; then
 dnl we need libibverbs-devel and librdmacm-devel to support rdma
   if test "$enable_rdma" = "yes"; then
     AC_CHECK_HEADER([infiniband/verbs.h],
-    [AC_DEFINE([HAVE_VERBS_H], [1],
-      [Define to 1 if you have infiniband/verbs.h.])],
+    [ AC_DEFINE([HAVE_VERBS_H] , [1], [Define to 1 if you have infiniband/verbs.h.])
+	IBVERBS_ENUM_CHECK([ibvwct_enums])
+        if test "$ibvwct_enums" = "1"; then
+		AC_DEFINE([HAVE_VERBS_IBVWCT_ENUMS], [1],
+		[Defined to 1 if you have IBV_WC_T* enum values in verbs.h.])
+	fi
+	],
     [AC_MSG_ERROR([Missing header. libibverbs-devel not installed?])])
 
     AC_CHECK_HEADER([rdma/rdma_cma.h],
@@ -183,13 +189,10 @@ AM_CONDITIONAL([ENABLE_librdmacm], [test "$HAVE_librdmacm" = "yes"])
 
 AC_DEFINE_UNQUOTED([HAVE_ZAP],["$have_zap"],[configured with zap transport (1) or not (0)])
 
-
-with_ssl=0
 have_auth=0
 if test "$enable_ovis_auth" = "yes"; then
 	have_auth=1
-	dnl Check for OpenSSL
-	AX_CHECK_OPENSSL([with_ssl=1],[with_ssl=0])
+	AX_CHECK_OPENSSL([],[AC_MSG_ERROR([openssl not found, and required by ovis_auth])])
 	AUTH_LIB="-lovis_auth"
 else
 	AUTH_LIB=""
@@ -197,7 +200,6 @@ fi
 AC_SUBST([AUTH_LIB])
 AC_SUBST([HAVE_AUTH],[$have_auth])
 AC_DEFINE_UNQUOTED([HAVE_AUTH],[$have_auth],[configured with authentication (1) or not (0)])
-AC_DEFINE_UNQUOTED([HAVE_SSL],[$with_ssl],[configured with ssl authentication support (1) or not (0)])
 
 OPTION_DEFAULT_ENABLE([sock], [ENABLE_SOCK])
 OPTION_DEFAULT_DISABLE([ugni], [ENABLE_UGNI])
@@ -234,6 +236,19 @@ OPTION_DEFAULT_DISABLE([amqp], [ENABLE_AMQP])
 dnl Options for contributed stores
 OPTION_DEFAULT_DISABLE([tutorial-store],[ENABLE_TUTORIAL_STORE])
 
+AC_ARG_ENABLE([timescale-store],
+        [AS_HELP_STRING([--enable-timescale-store], [enable timescaledb store plugin])],
+        [],
+        [enable_timescale_store="check"])
+AS_IF([test "x$enable_timescale_store" != xno ],[
+        AC_LIB_HAVE_LINKFLAGS([pq], [], [#include <libpq-fe.h>])
+        AS_IF([test "x$enable_timescale_store" != xcheck],[
+                AS_IF([test "x$HAVE_LIBPQ" = xno],
+                        [AC_MSG_ERROR([libpq or headers not found])])
+        ])
+])
+AM_CONDITIONAL([ENABLE_TIMESCALE_STORE], [test "x$HAVE_LIBPQ" = xyes])
+
 OPTION_DEFAULT_DISABLE([gpcdlocal], [ENABLE_GPCDLOCAL],[Required access to gpcd-support repository])
 OPTION_WITH_OR_BUILD([gpcdlocal],[../gpcd-support],[gpcd],[gpcdlocal.sh], ,[gpcd])
 OPTION_DEFAULT_DISABLE([sos], [ENABLE_SOS])
@@ -254,14 +269,11 @@ OPTION_DEFAULT_DISABLE([msr_interlagos], [ENABLE_MSR_INTERLAGOS])
 OPTION_DEFAULT_ENABLE([array_example], [ENABLE_ARRAY_EXAMPLE])
 OPTION_DEFAULT_ENABLE([hello_stream], [ENABLE_HELLO_STREAM])
 OPTION_DEFAULT_DISABLE([perfevent], [ENABLE_PERFEVENT])
-OPTION_DEFAULT_DISABLE([rapl], [ENABLE_RAPL])
-OPTION_DEFAULT_DISABLE([hweventpapi], [ENABLE_HWEVENTPAPI])
 OPTION_DEFAULT_DISABLE([mpi_sampler], [ENABLE_MPI_SAMPLER])
 OPTION_DEFAULT_DISABLE([mpi_noprofile], [ENABLE_MPI_NOPROFILE])
 if test -z "$ENABLE_MPI_SAMPLER_TRUE" ; then
 	AX_MPI([:],[ AC_MSG_ERROR([MPICC required by mpi_sampler ])])
 fi
-OPTION_WITH([libpapi], [LIBPAPI])
 OPTION_DEFAULT_ENABLE([procinterrupts], [ENABLE_PROCINTERRUPTS])
 OPTION_DEFAULT_ENABLE([procnetdev], [ENABLE_PROCNETDEV])
 OPTION_DEFAULT_ENABLE([procnfs], [ENABLE_PROCNFS])
@@ -294,10 +306,6 @@ OPTION_DEFAULT_DISABLE([switchx], [ENABLE_SWITCHX])
 OPTION_WITH([switchx], [SWITCHX],[/usr/local])
 OPTION_DEFAULT_DISABLE([kokkos], [ENABLE_KOKKOS])
 OPTION_DEFAULT_ENABLE([jobinfo-sampler], [ENABLE_JOBINFO])
-OPTION_DEFAULT_DISABLE([jobinfo-slurm], [ENABLE_SLURM_JOBINFO])
-OPTION_DEFAULT_DISABLE([spank-plugin], [ENABLE_SPANK_PLUGIN])
-OPTION_DEFAULT_ENABLE([slurm-sampler], [ENABLE_SLURM_SAMPLER])
-OPTION_DEFAULT_DISABLE([papi-sampler], [ENABLE_PAPI_SAMPLER])
 OPTION_DEFAULT_DISABLE([ibm_occ], [ENABLE_IBM_OCC_SAMPLER])
 OPTION_DEFAULT_DISABLE([appinfo], [ENABLE_APPINFO])
 OPTION_DEFAULT_DISABLE([app-sampler], [ENABLE_APP_SAMPLER])
@@ -325,40 +333,24 @@ if test -z "$ENABLE_INFLUX_TRUE"; then
 	LIBS="$TMPLIBS"
 fi
 
-OPTION_WITH([libpfm], [LIBPFM])
-OPTION_DEFAULT_DISABLE([syspapi-sampler], [ENABLE_SYSPAPI_SAMPLER])
-if test -z "$ENABLE_SYSPAPI_SAMPLER_TRUE" -o -z "$ENABLE_PAPI_SAMPLER_TRUE"; then
-	TMPLIBS="$LIBS"
-	TMPCFLAGS="$CFLAGS"
-	LIBS=""
-	AC_CHECK_LIB(papi, PAPI_library_init, [],
-		AC_MSG_ERROR([libpapi not found (required by papi-sampler/syspapi-sampler).]),
-		$LIBPAPI_LIBDIR_FLAG $LIBPAPI_LIB64DIR_FLAG)
-	LIBS=""
-	dnl Check headers
-	CFLAGS=$LIBPAPI_INCDIR_FLAG
-	AC_CHECK_HEADER(papi.h, [],
-		AC_MSG_ERROR([`papi.h` not found (required by papi-sampler/syspapi-sampler).]))
-	LIBS="$TMPLIBS"
-	CFLAGS="$TMPCFLAGS"
-fi
-
-if test -z "$ENABLE_SYSPAPI_SAMPLER_TRUE"; then
-	TMPLIBS="$LIBS"
-	TMPCFLAGS="$CFLAGS"
-	LIBS=""
-	AC_CHECK_LIB(pfm, pfm_initialize, [],
-		AC_MSG_ERROR([libpfm not found (required by syspapi-sampler).]),
-		$LIBPFM_LIBDIR_FLAG $LIBPFM_LIB64DIR_FLAG)
-	LIBS=""
-	dnl Check headers
-	CFLAGS=$LIBPFM_INCDIR_FLAG
-	AC_CHECK_HEADER(perfmon/pfmlib_perf_event.h, [],
-		AC_MSG_ERROR([`perfmon/pfmlib_perf_event.h` not found (required by syspapi-sampler).]))
-	LIBS="$TMPLIBS"
-	CFLAGS="$TMPCFLAGS"
-fi
-
+AC_ARG_ENABLE([papi],
+	[AS_HELP_STRING([--enable-papi], [require components that depend upon libpapi (and libpfm) @<:@default=check@:>@])],
+	[],
+	[enable_papi="check"])
+AS_IF([test "x$enable_papi" != xno],[
+	AC_LIB_HAVE_LINKFLAGS([papi], [], [#include <papi.h>])
+	AS_IF([test "x$enable_papi" != xcheck],[
+		AS_IF([test "x$HAVE_LIBPAPI" = xno],
+			[AC_MSG_ERROR([libpapi or headers not found])])
+	])
+	AC_LIB_HAVE_LINKFLAGS([pfm], [], [#include <perfmon/pfmlib_perf_event.h>])
+	AS_IF([test "x$enable_papi" != xcheck],[
+		AS_IF([test "x$HAVE_LIBPFM" = xno],
+			[AC_MSG_ERROR([libpfm or headers not found])])
+	])
+])
+AM_CONDITIONAL([HAVE_LIBPAPI], [test "x$HAVE_LIBPAPI" = xyes])
+AM_CONDITIONAL([HAVE_LIBPFM], [test "x$HAVE_LIBPFM" = xyes])
 
 if test -z "$ENABLE_KOKKOS_TRUE"; then
 	dnl kokkos needs sos (not the storesos).
@@ -448,16 +440,26 @@ if test -z "$ENABLE_SYSCLASSIB_TRUE"; then
 			libibumad-devel installed?]))
 fi
 
-dnl Checks for slurm includes
-OPTION_WITH([slurm], [SLURM], [/usr])
-if test -z "$ENABLE_SLURM_JOBINFO_TRUE"; then
-	OCFLAGS=$CFLAGS
-	CFLAGS=$SLURM_INCDIR_FLAG
-	AC_CHECK_HEADER(slurm/spank.h, [],
-		AC_MSG_ERROR([<slurm/spank.h> not found.
-			slurm installed?]))
-	CFLAGS=$OCFLAGS
-fi
+AC_ARG_WITH([slurm],
+	[AS_HELP_STRING([--with-slurm],
+			[support SLURM jobid information and more @<:@default=check@:>@])],
+			[AS_IF([test "x$withval" != xyes -a "x$withval" != xno],
+				[SLURM_CFLAGS="-I $withval/include"])],
+	[with_slurm=check])
+have_slurm=no
+AC_SUBST([SLURM_CFLAGS])
+AS_IF([test "x$with_slurm" != no],[
+	save_CFLAGS=$CFLAGS
+	CFLAGS="$CFLAGS $SLURM_CFLAGS"
+	AC_CHECK_HEADER([slurm/spank.h], [have_slurm=yes], [have_slurm=no])
+	CFLAGS=$save_CFLAGS
+
+	AS_IF([test "x$have_slurm=" = xno],[
+		AS_IF([test "x$with_slurm" != xcheck],
+			[AC_MSG_ERROR([<slurm/spank.h> not found. slurm installed?])],
+			[AC_MSG_WARN([Disabling SLURM support.])])])
+])
+AM_CONDITIONAL([HAVE_SLURM], [test "x$have_slurm" = xyes])
 
 if test -z "$ENABLE_SOS_TRUE"; then
 	CHECK_SOS=1
@@ -580,8 +582,6 @@ AS_IF([test "x$want_python" != xno], [
 AM_CONDITIONAL([ENABLE_PYTHON], [test "$python_found" = true -a "$cython_found" = true])
 
 OPTION_WITH_PORT([LDMSD],[411])
-
-OPTION_WITH_MAGIC([LDMS_MSG_MAX],[32768],[Maximum control message length allowed to ldmsd (min 4095)])
 
 dnl if cray_sampler set some other variables
 if test "x$enable_cray_system_sampler" = "xyes"
@@ -770,6 +770,7 @@ ldms/src/store/store_flatfile/Makefile
 ldms/src/store/store_app/Makefile
 ldms/src/contrib/store/Makefile
 ldms/src/contrib/store/tutorial/Makefile
+ldms/src/contrib/store/timescale/Makefile
 ldms/src/sampler/dstat/Makefile
 ldms/src/sampler/hello_stream/Makefile
 ldms/src/sampler/hello_stream/stream_configs/Makefile
@@ -844,7 +845,7 @@ AC_CONFIG_FILES([
 	ldms/scripts/ldms-meminfo.sh
 	ldms/scripts/ldms_local_opa2test.sh
 	ldms/scripts/ldms-l2_test.sh
-	ldms/src/test/ldms-run-static-tests.sh
+	ldms/src/test/ldms-run-static-tests.test
 	ldms/src/test/ldms-static-test-list.sh
 	ldms/src/test/ldms-static-test-bypass
 	], [chmod a+x $ac_file]

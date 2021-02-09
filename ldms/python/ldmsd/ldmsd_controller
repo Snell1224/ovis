@@ -76,6 +76,11 @@ LDMSD_STRGP_STATUS_REQ=0x204
 LDMSD_UPDTR_STATUS_REQ=0x304
 LDMSD_PLUGN_STATUS_REQ=0x504
 
+def cvt_intrvl_off_to_str(interval_us, offset_us):
+    interval_s = float(interval_us) / 1000000.0
+    offset_ms = float(offset_us) / 1000.0
+    return str(interval_s) + "s:" + str(offset_ms) + "ms"
+
 class LdmsdCmdParser(cmd.Cmd):
     def __init__(self, host = None, port = None, xprt = None, infile=None,
                  auth=None, auth_opt=None):
@@ -206,6 +211,8 @@ class LdmsdCmdParser(cmd.Cmd):
                 except:
                     raise
                 if (verb == "config" and name != "name") or (verb == "env"):
+                    attr_s.append(attr_str)
+                elif (verb == "auth_add" and name not in ["name", "plugin"]):
                     attr_s.append(attr_str)
                 else:
                     try:
@@ -647,11 +654,9 @@ class LdmsdCmdParser(cmd.Cmd):
         """
         resp = self.handle('daemon_status', arg)
         if resp['errcode'] == 0:
-            threads = json.loads(resp['msg'])
-            print("Thread          Task Count")
-            print("--------------- ----------")
-            for thr in threads:
-                print("{0:15} {1:>10}".format(thr['thread'], thr['task_count']))
+            o = json.loads(resp['msg'])
+            print(f"Deamon State: {o['state']}\n")
+            self.display_thread_stats(o['thread_stats'])
 
     def complete_daemon_status(self, text, line, begidx, endidx):
         return self.__complete_attr_list('daemon_status', text)
@@ -721,12 +726,18 @@ class LdmsdCmdParser(cmd.Cmd):
         resp = self.handle('updtr_status', arg)
         if resp['errcode'] == 0:
             updaters = json.loads(resp['msg'])
-            print("Name             Interval     Offset       Mode            State")
-            print("---------------- ------------ ------------ --------------- ------------")
+            print("Name             Interval:Offset  Auto   Mode            State")
+            print("---------------- ---------------- ------ --------------- ------------")
             for updtr in updaters:
-                print("{0:16} {1:12} {2:12} {3:15} {4}".format(
-                    updtr['name'], updtr['interval'], updtr['offset'],
-                    updtr['mode'], updtr['state']))
+                if 'auto' in updtr:
+                    auto = updtr['auto']
+                else:
+                    # for backward compatabiliity
+                    auto = updtr['????']
+                interval_s = cvt_intrvl_off_to_str(updtr['interval'], updtr['offset'])
+                print("{0:16} {1:16} {2:6} {3:15} {4}".format(
+                    updtr['name'], interval_s,
+                    auto, updtr['mode'], updtr['state']))
                 for prdcr in updtr['producers']:
                     print("    {0:16} {1:16} {2:12} {3:12} {4:12}".format(
                         prdcr['name'], prdcr['host'], prdcr['port'],
@@ -1007,8 +1018,9 @@ class LdmsdCmdParser(cmd.Cmd):
         """
         resp = self.handle('greeting', arg)
         if "level" in arg:
+            tbl = bytes(range(0, 256)) # identity mapping tbl
             for attr in resp['attr_list']:
-                print(attr.attr_value.translate(None, ' \x00'))
+                print(attr.attr_value.translate(tbl, delete=b' \x00').decode())
         elif resp['msg'] and resp['msg'] != "":
             print(resp['msg'])
 
@@ -1215,6 +1227,162 @@ class LdmsdCmdParser(cmd.Cmd):
     def complete_set_route(self, text, line, begidx, endidx):
         return self.__complete_attr_list('set_info', text)
 
+    def display_thread_stats(self, stats):
+        print(f"{'Name':16} {'Samples':12} {'Utilization':12}")
+        print("---------------- ------------ ------------")
+        for e in stats['entries']:
+            print(f"{e['name']:16} {e['sample_count']:12.0f} {e['utilization'] * 100:12.2f}")
+
+    def do_thread_stats(self, arg):
+        """
+        Query the daemon's thread utilization statistics
+        """
+        resp = self.handle('thread_stats', arg)
+        if resp['msg'] == "":
+            return
+        if resp['errcode'] != 0:
+            return
+        stats = json.loads(resp['msg'])
+        self.display_thread_stats(stats)
+
+    def complete_thread_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('thread_stats', text)
+
+    def display_prdcr_stats(self, stats):
+        """
+        {
+            "prdcr_count" : <int>,
+            "stopped" : <int>,
+            "disconnected" : <int>, 
+            "connecting" : <int>,
+            "connected" : <int>,
+            "stopping"	: <int>,
+            "compute_time" : <int>
+        }
+        """
+        print(f"Producer Stats - {stats['compute_time']}us")
+        print(f"{'Name':20} {'Count':16}")
+        print("-------------------- ----------------")
+        for n in stats:
+            if n == 'compute_time':
+                continue
+            print(f"{n:20} {stats[n]:16}")
+
+    def do_prdcr_stats(self, arg):
+        """
+        Query the daemon's producer statistics
+        """
+        resp = self.handle('prdcr_stats', arg)
+        if resp['msg'] == "":
+            return
+        if resp['errcode'] != 0:
+            return
+        stats = json.loads(resp['msg'])
+        self.display_prdcr_stats(stats)
+
+    def complete_prdcr_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('prdcr_stats', text)
+
+    def display_set_stats(self, stats):
+        """
+        {
+            "set_count" : <int>,
+            "deleting_count" : <int>,
+            "mem_total" : <int>, 
+            "mem_used" : <int>,
+            "mem_free" : <int>,
+            "compute_time" : <int>
+        }
+        """
+        print(f"Set Stats - {stats['compute_time']}us")
+        print(f"{'Name':20} {'Count':16}")
+        print("-------------------- ----------------")
+        for n in stats:
+            if n == 'compute_time':
+                continue
+            print(f"{n:20} {stats[n]:16}")
+
+    def do_set_stats(self, arg):
+        """
+        Query the daemon's set statistics
+        """
+        resp = self.handle('set_stats', arg)
+        if resp['msg'] == "":
+            return
+        if resp['errcode'] != 0:
+            return
+        stats = json.loads(resp['msg'])
+        self.display_set_stats(stats)
+
+    def complete_set_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('set_stats', text)
+
+    def display_xprt_stats(self, stats):
+        """
+        { 'compute_time_us': 33,
+          'connect_rate_s': 8e-06, 'connect_request_rate_s': 0.003638,
+          'disconnect_rate_s': 0.003632, 'reject_rate_s': 0.0,
+          'auth_fail_rate_s': 0.0, 'xprt_count': 32,
+          'connect_count': 7, 'connecting_count': 0, 'listen_count': 1,
+          'close_count': 24,
+          'duration': 12353.23,
+          'op_stats': {
+            'LOOKUP': {'count': 3187, 'total_us': 162961103,
+                        'min_us': 308, 'min_peer': '10.10.0.92:10001',
+                        'min_peer_type': 'sock',
+                        'max_us': 3290463, 'max_peer': '10.10.0.91:10001',
+                        'max_peer_type': 'sock', 'mean_us': 51133},
+            'UPDATE': {...},
+            'PUBLISH': {...},
+            'SET_DELETE': {...},
+            'DIR_REQ': {...},
+            'DIR_REP': {...},
+            'SEND': {...}
+          }
+        }
+        """
+        heading = f"Summary over {stats['duration']:.2f} seconds"
+        print(f"{heading:^64s}")
+        print(f"{'Connected':12s} {'Connecting':12s} {'Listening':12s} {'Close':12s}")
+        print("------------ ------------ ------------ ------------")
+        print(f"{stats['connect_count']:12} {stats['connecting_count']:12} "
+            f"{stats['listen_count']:12} {stats['close_count']:12}")
+        print("")
+        print(f"{'Rate/s':^64s}")
+        print(f"{'Connect':12} {'Conn Req':12} {'Disconnect':12} {'Reject':12} {'Auth Fail':12}")
+        print("------------ ------------ ------------ ------------ ------------")
+        print(f"{stats['connect_rate_s']:12.2f} "
+            f"{stats['connect_request_rate_s']:12.2f} "
+            f"{stats['disconnect_rate_s']:12.2f} "
+            f"{stats['reject_rate_s']:12.2f} "
+            f"{stats['auth_fail_rate_s']:12.2f} "
+            )
+        print("")
+        print(f"{'Operation':12} {'Count':12} {'Min(us)':12} {'Mean(us)':12} {'Max(us)':12} ")
+        print("------------ ------------ ------------ ------------ ------------")
+        op_stats = stats['op_stats']
+        for op_name in op_stats:
+            s = op_stats[op_name]
+            print(f"{op_name:12} {s['count']:12} {s['min_us']:12} {s['mean_us']:12} {s['max_us']:12}")                            
+
+    def do_xprt_stats(self, arg):
+        """
+        Query the daemon's transport telemetry data
+
+        Parameters:
+        [reset=]  If true, reset the statistics after returning them
+        """
+        resp = self.handle('xprt_stats', arg)
+        if resp['msg'] == "":
+            return
+        if resp['errcode'] != 0:
+            return
+        stats = json.loads(resp['msg'])
+        self.display_xprt_stats(stats)
+
+    def complete_xprt_stats(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('xprt_stats', text)
+
     def do_updtr_task(self, arg):
         """
         Report the updater tasks
@@ -1280,6 +1448,40 @@ class LdmsdCmdParser(cmd.Cmd):
     def complete_stream_client_dump(self, text, line, begidx, endidx):
         return self.__complete_attr_list('stream_client_dump', text)
 
+    def do_listen(self, arg):
+        """
+        Add a listen endpoint
+        
+        Parameters:
+            xprt=   Transport name [sock, rdma, ugni]
+            port=   Port number
+            [host=] Hostname
+            [auth=] Authenticantion domain.
+                    If this is omitted or auth=auth_default is give,
+                    the default authentication given the command line (-a and -A)
+                    will be used.. 
+        """
+        self.handle('listen', arg)
+
+    def complete_listen(self, text, lien, begidx, endidx):
+        return self.__complete_attr_list('listen', text)
+
+    def do_auth_add(self, arg):
+        """
+        Add an authentication domain
+        
+        Parameters:
+            name=      The authentication domain name
+            [plugin=]  The authentication plugin [none, ovis, munge]
+                       If this is omitted, the <name> value will be used as
+                       a plugin name.
+            <plugin-specific auth plugin attributes, path=.ldmsauth.conf>
+        """
+        self.handle('auth_add', arg)
+
+    def complete_auth_add(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('auth_add', text)
+
     def parseline(self, line):
         """Parse the line into a command name and a string containing
         the arguments.  Returns a tuple containing (command, args, line).
@@ -1322,8 +1524,8 @@ if __name__ == "__main__":
         parser.add_argument('--port',
                             help = "Inet ctrl listener port of ldmsd")
         parser.add_argument('--xprt',
-                            help = "LDMS Transport type: sock, ugni, rdma.",
-                            choices = ['sock', 'ugni', 'rdma'],
+                            help = "LDMS Transport type",
+                            choices = ['sock', 'ugni', 'rdma', 'fabric'],
                             default = 'sock')
         parser.add_argument('--source',
                             help = "Path to the config file")
@@ -1376,8 +1578,6 @@ if __name__ == "__main__":
         sys.exit(0)
     except Exception as e:
         if is_debug:
-            print(is_debug)
-            traceback.print_exc()
-            sys.exit(2)
+            raise
         else:
             print(e)

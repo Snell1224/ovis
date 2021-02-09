@@ -115,9 +115,9 @@ char *str_repl_cmd(const char *_str)
 {
 	FILE *p = NULL;
 	char *str = strdup(_str);
+	char *buff = NULL;
 	if (!str)
 		goto err;
-	char *buff = NULL;
 	char *xbuff;
 	const char *eos = str + strlen(str);
 	size_t slen = 0; /* strlen of buff */
@@ -658,6 +658,8 @@ __attribute__ ((sentinel)) int ovis_join_buf(char *buf, size_t buflen, char *pat
 
 	if (!buf)
 		return EINVAL;
+	buf[0] = '\0';
+	
 
 	va_start(ap, pathsep);
 	n = va_arg(ap, const char *);
@@ -668,7 +670,6 @@ __attribute__ ((sentinel)) int ovis_join_buf(char *buf, size_t buflen, char *pat
 
 	chunk = strlen(n);
 	if ( (len + chunk) < buflen) {
-		printf("chunk %zu %s\n", chunk, n);
 		strncat(buf + len, n, chunk);
 		len += chunk;
 	} else {
@@ -821,6 +822,11 @@ int ovis_access_check(uid_t auid, gid_t agid, int acc,
 		      uid_t ouid, gid_t ogid, int perm)
 {
 	int macc = acc & perm;
+
+	/* root can do anything */
+	if (auid == 0)
+		return 0;
+
 	/* other */
 	if (07 & macc) {
 		return 0;

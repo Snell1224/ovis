@@ -172,7 +172,7 @@ struct ldmsd_plugin_cfg *new_plugin(char *plugin_name,
 			 "function.", plugin_name);
 		goto err;
 	}
-	lpi = pget(ldmsd_msg_logger);
+	lpi = pget(ldmsd_log);
 	if (!lpi) {
 		snprintf(errstr, errlen, "The plugin '%s' could not be loaded.",
 								plugin_name);
@@ -992,10 +992,6 @@ static void __listen_connect_cb(ldms_t x, ldms_xprt_event_t e, void *cb_arg)
 	}
 }
 
-/* from ldmsd */
-extern const char *auth_name;
-extern struct attr_value_list *auth_opt;
-
 int listen_on_ldms_xprt(ldmsd_listen_t listen)
 {
 	int rc = 0;
@@ -1005,29 +1001,15 @@ int listen_on_ldms_xprt(ldmsd_listen_t listen)
 				    .ai_flags = AI_PASSIVE };
 	char port_buff[8];
 
-	listen->x = ldms_xprt_new_with_auth(listen->xprt, ldmsd_linfo,
-			listen->auth_name, listen->auth_attrs);
-	if (!listen->x) {
-		char *args = av_to_string(listen->auth_attrs, AV_EXPAND);
-		ldmsd_log(LDMSD_LERROR,
-			  "'%s' transport creation with auth '%s' "
-			  "failed, error: %s(%d). args='%s'. Please check transport "
-			  "configuration, authentication configuration, "
-			  "ZAP_LIBPATH (env var), and LD_LIBRARY_PATH.\n",
-			  listen->xprt,
-			  auth_name,
-			  ovis_errno_abbvr(errno),
-			  errno, args ? args : "(empty conf=)");
-		free(args);
-		cleanup(6, "error creating transport");
-	}
+	assert(listen->x);
+
 	sin.sin_family = AF_INET;
 	if (listen->host) {
 		snprintf(port_buff, sizeof(port_buff), "%hu", listen->port_no);
 		rc = getaddrinfo(listen->host, port_buff, &ai_hint, &ai);
 		if (rc) {
 			ldmsd_lerror("xprt listen error, getaddrinfo(%s, %s) error: %d\n", listen->host, port_buff, rc);
-			cleanup(7, "error listening on transport");
+			return rc;
 		}
 		memcpy(&sin, ai->ai_addr, ai->ai_addrlen);
 		freeaddrinfo(ai);
@@ -1040,7 +1022,7 @@ int listen_on_ldms_xprt(ldmsd_listen_t listen)
 	if (rc) {
 		ldmsd_log(LDMSD_LERROR, "Error %d listening on the '%s' "
 				"transport.\n", rc, listen->xprt);
-		cleanup(7, "error listening on transport");
+		return rc;
 	}
 	ldmsd_log(LDMSD_LINFO, "Listening on %s:%d using `%s` transport and "
 		  "`%s` authentication\n",

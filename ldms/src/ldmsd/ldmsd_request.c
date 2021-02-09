@@ -60,6 +60,7 @@
 #include <ovis_util/util.h>
 #include <ovis_json/ovis_json.h>
 #include <arpa/inet.h>
+#include "mmalloc.h"
 #include "ldms.h"
 #include "ldmsd.h"
 #include "ldmsd_request.h"
@@ -98,6 +99,9 @@ int ldmsd_req_debug = 0; /* turn on / off using gdb or edit src to
 static int cleanup_requested = 0;
 
 void __ldmsd_log(enum ldmsd_loglevel level, const char *fmt, va_list ap);
+
+static char * __thread_stats_as_json(size_t *json_sz);
+static char * __xprt_stats_as_json(size_t *json_sz);
 
 __attribute__((format(printf, 1, 2)))
 static inline
@@ -197,6 +201,9 @@ static int exit_daemon_handler(ldmsd_req_ctxt_t req_ctxt);
 static int greeting_handler(ldmsd_req_ctxt_t req_ctxt);
 static int set_route_handler(ldmsd_req_ctxt_t req_ctxt);
 static int xprt_stats_handler(ldmsd_req_ctxt_t req_ctxt);
+static int prdcr_stats_handler(ldmsd_req_ctxt_t req_ctxt);
+static int thread_stats_handler(ldmsd_req_ctxt_t req_ctxt);
+static int set_stats_handler(ldmsd_req_ctxt_t req_ctxt);
 static int unimplemented_handler(ldmsd_req_ctxt_t req_ctxt);
 static int eperm_handler(ldmsd_req_ctxt_t req_ctxt);
 static int ebusy_handler(ldmsd_req_ctxt_t reqc);
@@ -419,7 +426,16 @@ static struct request_handler_entry request_handler[] = {
 
 	/* Transport Stats Request */
 	[LDMSD_XPRT_STATS_REQ] = {
-		LDMSD_XPRT_STATS_REQ, xprt_stats_handler, XUG
+		LDMSD_XPRT_STATS_REQ, xprt_stats_handler, XALL
+	},
+	[LDMSD_THREAD_STATS_REQ] = {
+		LDMSD_THREAD_STATS_REQ, thread_stats_handler, XALL
+	},
+	[LDMSD_PRDCR_STATS_REQ] = {
+		LDMSD_PRDCR_STATS_REQ, prdcr_stats_handler, XALL
+	},
+	[LDMSD_SET_STATS_REQ] = {
+		LDMSD_SET_STATS_REQ, set_stats_handler, XALL
 	},
 
 	/* FAILOVER user commands */
@@ -3306,7 +3322,7 @@ int __updtr_status_json_obj(ldmsd_req_ctxt_t reqc, ldmsd_updtr_t updtr,
 	ldmsd_prdcr_t prdcr;
 	int prdcr_count;
 	long default_offset = 0;
-	const char *prdcr_state_str(enum ldmsd_prdcr_state state);
+	extern const char *prdcr_state_str(enum ldmsd_prdcr_state state);
 
 	if (updtr_cnt) {
 		rc = linebuf_printf(reqc, ",\n");
@@ -3323,6 +3339,7 @@ int __updtr_status_json_obj(ldmsd_req_ctxt_t reqc, ldmsd_updtr_t updtr,
 		"\"offset\":\"%ld\","
 		"\"sync\":\"%s\","
 		"\"mode\":\"%s\","
+		"\"auto\":\"%s\","
 		"\"state\":\"%s\","
 		"\"producers\":[",
 		updtr->obj.name,
@@ -3330,6 +3347,7 @@ int __updtr_status_json_obj(ldmsd_req_ctxt_t reqc, ldmsd_updtr_t updtr,
 		default_offset,
 		((updtr->default_task.task_flags==LDMSD_TASK_F_SYNCHRONOUS)?"true":"false"),
 		update_mode(updtr->push_flags),
+		(updtr->is_auto_task ? "true" : "false"),
 		ldmsd_updtr_state_str(updtr->state));
 	if (rc)
 		goto out;
@@ -4754,31 +4772,21 @@ out:
 
 int __daemon_status_json_obj(ldmsd_req_ctxt_t reqc)
 {
-	int rc = 0;
+	int rc;
+	char *json_s;
+	size_t json_sz;
 
-	extern int ev_thread_count;
-	extern pthread_t *ev_thread;
-	extern int *ev_count;
-	int i;
-
-	rc = linebuf_printf(reqc, "[");
+	rc = linebuf_printf(reqc, "{\"state\":\"ready\",\n");
 	if (rc)
 		return rc;
-	for (i = 0; i < ev_thread_count; i++) {
-		if (i) {
-			rc = linebuf_printf(reqc, ",\n");
-			if (rc)
-				return rc;
-		}
-
-		rc = linebuf_printf(reqc,
-				"{ \"thread\":\"%p\","
-				"\"task_count\":\"%d\"}",
-				(void *)ev_thread[i], ev_count[i]);
-		if (rc)
-			return rc;
-	}
-	rc = linebuf_printf(reqc, "]");
+	json_s = __thread_stats_as_json(&json_sz);
+	if (!json_s)
+		return ENOMEM;
+	rc = linebuf_printf(reqc, "\"thread_stats\":%s\n", json_s);
+	free(json_s);
+	if (rc)
+		return rc;
+	rc = linebuf_printf(reqc, "}");
 	return rc;
 }
 
@@ -5010,7 +5018,7 @@ static int __greeting_path_resp_handler(ldmsd_req_cmd_t rcmd)
 	my_attr.discrim = 1;
 	my_attr.attr_id = LDMSD_ATTR_STRING;
 	/* +1 for : */
-	my_attr.attr_len = server_attr->attr_len + strlen((char *)rcmd->ctxt) + 2;
+	my_attr.attr_len = server_attr->attr_len + strlen((char *)rcmd->ctxt) + 1;
 	path = malloc(my_attr.attr_len);
 	if (!path) {
 		rcmd->org_reqc->errcode = ENOMEM;
@@ -5050,7 +5058,7 @@ static int __greeting_path_req_handler(ldmsd_req_ctxt_t reqc)
 		attr.attr_len = strlen(myself);
 		ldmsd_hton_req_attr(&attr);
 		ldmsd_append_reply(reqc, (char *)&attr, sizeof(attr), LDMSD_REQ_SOM_F);
-		ldmsd_append_reply(reqc, myself, strlen(myself), 0);
+		ldmsd_append_reply(reqc, myself, strlen(myself)+1, 0);
 		free(myself);
 		attr.discrim = 0;
 		ldmsd_append_reply(reqc, (char *)&attr.discrim, sizeof(attr.discrim), LDMSD_REQ_EOM_F);
@@ -5534,18 +5542,33 @@ struct op_summary {
 	uint64_t op_mean_us;
 };
 
-static int xprt_stats_handler(ldmsd_req_ctxt_t req)
+#define __APPEND_SZ 4096
+#define __APPEND(...) do {					\
+	int len = snprintf(s, sz, __VA_ARGS__);			\
+	if (len >= sz) {					\
+		uint64_t off = (uint64_t)s - (uint64_t)buff;	\
+		sz += __APPEND_SZ;				\
+		s = realloc(buff, sz);				\
+		if (!s) {					\
+			goto __APPEND_ERR;				\
+		}						\
+		buff = s;					\
+		s = &buff[off];					\
+		continue;					\
+	}							\
+	s += len;						\
+	sz -= len;						\
+	break;							\
+} while(1)
+
+static char *__xprt_stats_as_json(size_t *json_sz)
 {
-	#define XPRT_BUFLEN 4096
-	char *buff, *s;
-	size_t sz = XPRT_BUFLEN;
-	int rc, len;
-	uint32_t term;
-	const char *errmsg = NULL;
-	ldmsd_req_attr_t attr;
-	struct ldms_xprt *x;
+	char *buff;
+	char *s;
+	size_t sz = __APPEND_SZ;
 	struct ldms_xprt_stats xs;
 	struct op_summary op_sum[LDMS_XPRT_OP_COUNT];
+	struct ldms_xprt *x;
 	enum ldms_xprt_ops_e op_e;
 	int xprt_count = 0;
 	int xprt_connect_count = 0;
@@ -5560,54 +5583,29 @@ static int xprt_stats_handler(ldmsd_req_ctxt_t req)
 	char ip_str[32];
 	char xprt_type[16];
 	struct ldms_xprt_rate_data rate_data;
+	int reset = 0;
 
-	ldms_xprt_rate_data(&rate_data);
+	(void)clock_gettime(CLOCK_REALTIME, &start);
+
+	ldms_xprt_rate_data(&rate_data, reset);
 
 	buff = malloc(sz);
-	if (!buff) {
-		rc = ENOMEM;
-		errmsg = LDMSD_ENOMEM_MSG;
-		goto err;
-	}
-	attr = (ldmsd_req_attr_t)buff;
-	attr->discrim = 1;
-	attr->attr_id = LDMSD_ATTR_JSON;
-	/* len will be assigned after the str is populated */
-	s = buff + sizeof(*attr);
-	sz -= sizeof(*attr);
-
-	#define __APPEND(...) do {					\
-		len = snprintf(s, sz, __VA_ARGS__);			\
-		if (len >= sz) {					\
-			uint64_t off = (uint64_t)s - (uint64_t)buff;	\
-			sz += XPRT_BUFLEN;				\
-			s = realloc(buff, sz);				\
-			if (!s) {					\
-				rc = ENOMEM;				\
-				errmsg = LDMSD_ENOMEM_MSG;		\
-				goto err;				\
-			}						\
-			buff = s;					\
-			s = &buff[off];					\
-			continue;					\
-		}							\
-		s += len;						\
-		sz -= len;						\
-		break;							\
-	} while(1)
+	if (!buff)
+		return NULL;
+	s = buff;
 
 	memset(op_sum, 0, sizeof(op_sum));
 	for (op_e = 0; op_e < LDMS_XPRT_OP_COUNT; op_e++)
 		op_sum[op_e].op_min_us = LLONG_MAX;
 
 	/* Compute summary statistics across all of the transports */
-	(void)clock_gettime(CLOCK_REALTIME, &start);
 	for (x = ldms_xprt_first(); x; x = ldms_xprt_next(x)) {
 		ldms_stats_entry_t op;
 
 		ldms_xprt_stats(x, &xs);
 		xprt_count += 1;
-		zap_ep_state_t ep_state = zap_ep_state(x->zap_ep);
+		zap_ep_state_t ep_state =
+			(x->zap_ep ? zap_ep_state(x->zap_ep) : ZAP_EP_CLOSE);
 		switch (ep_state) {
 		case ZAP_EP_LISTENING:
 			xprt_listen_count += 1;
@@ -5665,6 +5663,8 @@ static int xprt_stats_handler(ldmsd_req_ctxt_t req)
 	__APPEND(" \"connecting_count\": %d,\n", xprt_connecting_count);
 	__APPEND(" \"listen_count\": %d,\n", xprt_listen_count);
 	__APPEND(" \"close_count\": %d,\n", xprt_close_count);
+	__APPEND(" \"duration\": %g,\n", rate_data.duration);
+	__APPEND(" \"op_stats\": {\n");
 	for (op_e = 0; op_e < LDMS_XPRT_OP_COUNT; op_e++) {
 		struct op_summary *op;
 		op = &op_sum[op_e];
@@ -5712,30 +5712,340 @@ static int xprt_stats_handler(ldmsd_req_ctxt_t req)
 		else
 			__APPEND(" }\n");
 	}
+	__APPEND(" }\n"); /* op_stats */
 	__APPEND("}");
-	sz = s - buff + 1;
-	attr->attr_len = sz - sizeof(*attr);
-	ldmsd_hton_req_attr(attr);
-	rc = ldmsd_append_reply(req, buff, sz, LDMSD_REQ_SOM_F);
-	if (rc) {
-		errmsg = "append reply error";
-		goto err;
+	*json_sz = s - buff + 1;
+	return buff;
+__APPEND_ERR:
+	return NULL;
+}
+
+static int xprt_stats_handler(ldmsd_req_ctxt_t req)
+{
+	char *s, *json_s;
+	size_t json_sz;
+	int reset = 0;
+	struct ldmsd_req_attr_s attr;
+
+	s = ldmsd_req_attr_str_value_get_by_id(req, LDMSD_ATTR_RESET);
+	if (s) {
+		if (0 != strcasecmp(s, "false"))
+			reset = 1;
 	}
-	term = 0;
-	rc = ldmsd_append_reply(req, (void*)&term, sizeof(term),
-				LDMSD_REQ_EOM_F);
-	if (rc) {
-		errmsg = "append reply error";
+
+	json_s = __xprt_stats_as_json(&json_sz);
+	if (!json_s)
 		goto err;
-	}
-	free(buff);
+
+	attr.discrim = 1;
+	attr.attr_id = LDMSD_ATTR_JSON;
+	attr.attr_len = json_sz;
+	ldmsd_hton_req_attr(&attr);
+
+	if (ldmsd_append_reply(req, (const char *)&attr, sizeof(attr), LDMSD_REQ_SOM_F))
+		goto err;
+
+	if (ldmsd_append_reply(req, json_s, json_sz, 0))
+		goto err;
+
+	attr.discrim = 0;
+	if (ldmsd_append_reply(req, (const char *)&attr.discrim, sizeof(attr.discrim), LDMSD_REQ_EOM_F))
+		goto err;
+
+	free(json_s);
 	return 0;
+
 err:
+	free(json_s);
+	req->errcode = ENOMEM;
+	ldmsd_send_req_response(req, "Memory allocation error.");
+	return ENOMEM;
+}
+
+/*
+ * Sends a JSON formatted summary of Zap thread statistics as follows:
+ *
+ * { "count" : <int>,
+ *   "entries" : [
+ * 		{ "name" : <string>,
+ *  	  "sample_count" : <float>,
+ *        "utilization" : <float>
+ *      },
+ *      . . .
+ *   ]
+ * }
+ */
+static char * __thread_stats_as_json(size_t *json_sz)
+{
+	char *buff, *s;
+	size_t sz = __APPEND_SZ;
+	int i;
+	struct timespec start, end;
+	struct zap_thrstat_result *res;
+
+	(void)clock_gettime(CLOCK_REALTIME, &start);
+
+	res = zap_thrstat_get_result();
+	if (!res)
+		return NULL;
+		
+	buff = malloc(sz);
+	if (!buff)
+		goto __APPEND_ERR;
+	s = buff;
+
+	__APPEND("{");
+	__APPEND(" \"count\": %d,\n", res->count);
+	__APPEND(" \"entries\": [\n");
+	for (i = 0; i < res->count; i++) {
+		__APPEND("  {\n");
+		__APPEND("   \"name\": \"%s\",\n", res->entries[i].name);
+		__APPEND("   \"sample_count\": %g,\n", res->entries[i].sample_count);
+		__APPEND("   \"utilization\": %g\n", res->entries[i].utilization);
+		if (i < res->count - 1)
+			__APPEND("  },\n");
+		else
+			__APPEND("  }\n");
+	}
+	(void)clock_gettime(CLOCK_REALTIME, &end);
+	uint64_t compute_time = ldms_timespec_diff_us(&start, &end);
+	__APPEND(" ],\n"); /* end of entries array */
+	__APPEND(" \"compute_time\": %ld\n", compute_time);
+	__APPEND("}"); /* end */
+
+	*json_sz = s - buff + 1;
+	zap_thrstat_free_result(res);
+	return buff;
+__APPEND_ERR:
+	zap_thrstat_free_result(res);
 	if (buff)
 		free(buff);
-	req->errcode = rc;
-	ldmsd_send_req_response(req, errmsg);
-	return rc;
+	return NULL;
+}
+
+static int thread_stats_handler(ldmsd_req_ctxt_t req)
+{
+	char *json_s, *s;
+	size_t json_sz;
+	int reset = 0;
+	struct ldmsd_req_attr_s attr;
+
+	s = ldmsd_req_attr_str_value_get_by_id(req, LDMSD_ATTR_RESET);
+	if (s) {
+		if (0 != strcasecmp(s, "false"))
+			reset = 1;
+	}
+
+	json_s = __thread_stats_as_json(&json_sz);
+	if (!json_s)
+		goto err;
+
+	attr.discrim = 1;
+	attr.attr_id = LDMSD_ATTR_JSON;
+	attr.attr_len = json_sz;
+	ldmsd_hton_req_attr(&attr);
+	if (ldmsd_append_reply(req, (const char *)&attr, sizeof(attr), LDMSD_REQ_SOM_F))
+		goto err;
+	if (ldmsd_append_reply(req, json_s, json_sz, 0))
+		goto err;
+	attr.discrim = 0;
+	if (ldmsd_append_reply(req, (const char *)&attr, sizeof(attr.discrim), LDMSD_REQ_EOM_F))
+		goto err;
+
+	free(json_s);
+	if (reset)
+		zap_thrstat_reset_all();
+	return 0;
+err:
+	free(json_s);
+	req->errcode = ENOMEM;
+	ldmsd_send_req_response(req, "Memory allocation failure.");
+	return ENOMEM;
+}
+
+/*
+ * Sends a JSON formatted summary of Producer statistics as follows:
+ *
+ * {
+ *   "prdcr_count" : <int>,
+ *   "stopped" : <int>,
+ *   "disconnected" : <int>, 
+ *   "connecting" : <int>,
+ * 	 "connected" : <int>,
+ *   "stopping"	: <int>,
+ *   "compute_time" : <int>
+ * }
+ */
+static char * __prdcr_stats_as_json(size_t *json_sz)
+{
+	ldmsd_prdcr_t prdcr;
+	struct timespec start, end;
+	char *buff, *s;
+	size_t sz = __APPEND_SZ;
+	int prdcr_count = 0, stopped_count = 0, disconnected_count = 0,
+		connecting_count = 0, connected_count = 0, stopping_count = 0,
+		set_count = 0;
+
+	(void)clock_gettime(CLOCK_REALTIME, &start);
+	ldmsd_cfg_lock(LDMSD_CFGOBJ_PRDCR);
+	for (prdcr = ldmsd_prdcr_first(); prdcr;
+			prdcr = ldmsd_prdcr_next(prdcr)) {
+		prdcr_count += 1;
+		switch (prdcr->conn_state) {
+		case LDMSD_PRDCR_STATE_STOPPED:
+			stopped_count++;
+			break;
+		case LDMSD_PRDCR_STATE_DISCONNECTED:
+			disconnected_count++;
+			break;
+		case LDMSD_PRDCR_STATE_CONNECTING:
+			connecting_count++;
+			break;
+		case LDMSD_PRDCR_STATE_CONNECTED:
+			connected_count++;
+			break;
+		case LDMSD_PRDCR_STATE_STOPPING:
+			stopping_count++;
+			break;
+		}
+		set_count += rbt_card(&prdcr->set_tree);
+	}
+	ldmsd_cfg_unlock(LDMSD_CFGOBJ_PRDCR);
+
+	buff = malloc(sz);
+	if (!buff)
+		goto __APPEND_ERR;
+	s = buff;
+
+	__APPEND("{");
+	__APPEND(" \"prdcr_count\": %d,\n", prdcr_count);
+	__APPEND(" \"stopped_count\": %d,\n", stopped_count);
+	__APPEND(" \"disconnected_count\": %d,\n", disconnected_count);
+	__APPEND(" \"connecting_count\": %d,\n", connecting_count);
+	__APPEND(" \"connected_count\": %d,\n", connected_count);
+	__APPEND(" \"stopping_count\": %d,\n", stopping_count);
+	__APPEND(" \"set_count\": %d,\n", set_count);
+	(void)clock_gettime(CLOCK_REALTIME, &end);
+	uint64_t compute_time = ldms_timespec_diff_us(&start, &end);
+	__APPEND(" \"compute_time\": %ld\n", compute_time);
+	__APPEND("}"); /* end */
+
+	*json_sz = s - buff + 1;
+	return buff;
+
+__APPEND_ERR:
+	if (buff)
+		free(buff);
+	return NULL;
+}
+
+static int prdcr_stats_handler(ldmsd_req_ctxt_t req)
+{
+	char *json_s;
+	size_t json_sz;
+	struct ldmsd_req_attr_s attr;
+
+	json_s = __prdcr_stats_as_json(&json_sz);
+	if (!json_s)
+		goto err;
+
+	attr.discrim = 1;
+	attr.attr_id = LDMSD_ATTR_JSON;
+	attr.attr_len = json_sz;
+	ldmsd_hton_req_attr(&attr);
+	if (ldmsd_append_reply(req, (const char *)&attr, sizeof(attr), LDMSD_REQ_SOM_F))
+		goto err;
+	if (ldmsd_append_reply(req, json_s, json_sz, 0))
+		goto err;
+	attr.discrim = 0;
+	if (ldmsd_append_reply(req, (const char *)&attr, sizeof(attr.discrim), LDMSD_REQ_EOM_F))
+		goto err;
+
+	free(json_s);
+	return 0;
+err:
+	free(json_s);
+	req->errcode = ENOMEM;
+	ldmsd_send_req_response(req, "Memory allocation failure.");
+	return ENOMEM;
+}
+
+/*
+ * Sends a JSON formatted summary of Metric Set statistics as follows:
+ *
+ * {
+ *   "active_count" : <int>,
+ *   "deleting_count" : <int>,
+ *   "mem_total" : <int>,
+ *   "mem_used" : <int>,
+ *   "mem_free" : <int>,
+ *   "compute_time" : <int>
+ * }
+ */
+static char * __set_stats_as_json(size_t *json_sz)
+{
+	struct timespec start, end;
+	char *buff, *s;
+	size_t sz = __APPEND_SZ;
+	struct mm_stat stats;
+
+	(void)clock_gettime(CLOCK_REALTIME, &start);
+	mm_stats(&stats);
+
+	buff = malloc(sz);
+	if (!buff)
+		goto __APPEND_ERR;
+	s = buff;
+
+	__APPEND("{");
+	__APPEND(" \"active_count\": %d,\n", ldms_set_count());
+	__APPEND(" \"deleting_count\": %d,\n", ldms_set_deleting_count());
+	__APPEND(" \"mem_total_kb\": %g,\n", (double)stats.size / 1024.0);
+	__APPEND(" \"mem_free_kb\": %g,\n", (double)(stats.bytes * stats.grain) / 1024.0);
+	__APPEND(" \"mem_used_kb\": %g,\n", (double)(stats.size - (stats.bytes * stats.grain)) / 1024.0);
+	(void)clock_gettime(CLOCK_REALTIME, &end);
+	uint64_t compute_time = ldms_timespec_diff_us(&start, &end);
+	__APPEND(" \"compute_time\": %ld\n", compute_time);
+	__APPEND("}"); 
+
+	*json_sz = s - buff + 1;
+	return buff;
+
+__APPEND_ERR:
+	if (buff)
+		free(buff);
+	return NULL;
+}
+
+static int set_stats_handler(ldmsd_req_ctxt_t req)
+{
+	char *json_s;
+	size_t json_sz;
+	struct ldmsd_req_attr_s attr;
+
+	json_s = __set_stats_as_json(&json_sz);
+	if (!json_s)
+		goto err;
+
+	attr.discrim = 1;
+	attr.attr_id = LDMSD_ATTR_JSON;
+	attr.attr_len = json_sz;
+	ldmsd_hton_req_attr(&attr);
+	if (ldmsd_append_reply(req, (const char *)&attr, sizeof(attr), LDMSD_REQ_SOM_F))
+		goto err;
+	if (ldmsd_append_reply(req, json_s, json_sz, 0))
+		goto err;
+	attr.discrim = 0;
+	if (ldmsd_append_reply(req, (const char *)&attr, sizeof(attr.discrim), LDMSD_REQ_EOM_F))
+		goto err;
+
+	free(json_s);
+	return 0;
+err:
+	free(json_s);
+	req->errcode = ENOMEM;
+	ldmsd_send_req_response(req, "Memory allocation failure.");
+	return ENOMEM;
 }
 
 static int stream_publish_handler(ldmsd_req_ctxt_t reqc)
@@ -5961,6 +6271,7 @@ static int stream_subscribe_handler(ldmsd_req_ctxt_t reqc)
 			       len, 256);
 		goto send_reply;
 	}
+	key->addr_len = sizeof(key->addr);
 	rc = ldms_xprt_sockaddr(reqc->xprt->ldms.ldms, &local_sa, &key->addr,
 				&key->addr_len);
 	if (rc) {
@@ -5990,8 +6301,9 @@ static int stream_subscribe_handler(ldmsd_req_ctxt_t reqc)
 			       "Memory allocation failed");
 		goto send_reply;
 	}
+
 	ent->client = ldmsd_stream_subscribe(stream_name, stream_republish_cb,
-						reqc->xprt->ldms.ldms);
+					ldms_xprt_get(reqc->xprt->ldms.ldms));
 	if (!ent->client) {
 		__RSE_rbt_unlock();
 		free(ent);
@@ -6035,6 +6347,7 @@ static int stream_unsubscribe_handler(ldmsd_req_ctxt_t reqc)
 			       len, 256);
 		goto send_reply;
 	}
+	key->addr_len = sizeof(key->addr);
 	rc = ldms_xprt_sockaddr(reqc->xprt->ldms.ldms, &local_sa, &key->addr,
 				&key->addr_len);
 	if (rc) {
@@ -6107,12 +6420,13 @@ void stream_xprt_term(ldms_t x)
 	struct __RSE_key_s *key = (void*)_buff;
 	int rc;
 
+	key->addr_len = sizeof(key->addr);
 	rc = ldms_xprt_sockaddr(x, &local_sa, &key->addr,
 				&key->addr_len);
 	if (rc)
 		return;
 	__RSE_rbt_lock();
-	rbn = rbt_find_lub(&__RSE_rbt, &key);
+	rbn = rbt_find_lub(&__RSE_rbt, key);
 	while (rbn) {
 		ent = container_of(rbn, struct __RSE_s, rbn);
 		if (key->addr_len != ent->key.addr_len)
@@ -6125,6 +6439,7 @@ void stream_xprt_term(ldms_t x)
 		__RSE_del(ent);
 		ldmsd_stream_close(ent->client);
 		__RSE_free(ent);
+		ldms_xprt_put(x);
 	}
 	__RSE_rbt_unlock();
 }
@@ -6147,23 +6462,13 @@ int ldmsd_auth_opt_add(struct attr_value_list *auth_attrs, char *name, char *val
 	return 0;
 }
 
+extern int ldmsd_listen_start(ldmsd_listen_t listen);
 static int listen_handler(ldmsd_req_ctxt_t reqc)
 {
 	ldmsd_listen_t listen;
 	char *xprt, *port, *host, *auth, *attr_name;
 	unsigned short port_no = -1;
 	xprt = port = host = auth = NULL;
-
-	if (ldmsd_is_initialized()) {
-		/*
-		 * Adding a new listening endpoint is prohibited
-		 * after LDMSD is initialized.
-		 */
-		reqc->errcode = EPERM;
-		linebuf_printf(reqc, "LDMSD is started. "
-				"Adding a listening endpoint is prohibited.");
-		goto send_reply;
-	}
 
 	attr_name = "xprt";
 	xprt = ldmsd_req_attr_str_value_get_by_id(reqc, LDMSD_ATTR_XPRT);
@@ -6187,9 +6492,29 @@ static int listen_handler(ldmsd_req_ctxt_t reqc)
 	if (!listen) {
 		if (errno == EEXIST)
 			goto eexist;
+		else if (errno == ENOENT) {
+			reqc->errcode = ENOENT;
+			(void) snprintf(reqc->line_buf, reqc->line_len,
+					"Listen error: authentication domain "
+					"'%s' not found. Please make sure "
+					"that it is created with `auth_add` "
+					"config command.",
+					auth);
+			goto send_reply;
+		}
 		else
 			goto enomem;
 	}
+
+	if (ldmsd_is_initialized()) {
+		reqc->errcode = ldmsd_listen_start(listen);
+		if (reqc->errcode) {
+			(void)snprintf(reqc->line_buf, reqc->line_len,
+				"Failed to listen on the endpoint %s:%s.",
+				xprt, port);
+		}
+	}
+
 	goto send_reply;
 
 eexist:
@@ -6206,6 +6531,7 @@ einval:
 	reqc->errcode = EINVAL;
 	(void) snprintf(reqc->line_buf, reqc->line_len,
 			"The attribute '%s' is required.", attr_name);
+	goto send_reply;
 send_reply:
 	ldmsd_send_req_response(reqc, reqc->line_buf);
 	if (xprt)

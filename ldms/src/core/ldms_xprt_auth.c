@@ -55,11 +55,7 @@
 
 #include "ldms_xprt.h"
 #include "ldms_auth.h"
-
-/* functions from ldms_xprt.c */
-struct ldms_context *__ldms_alloc_ctxt(struct ldms_xprt *x, size_t sz,
-		ldms_context_type_t type);
-void __ldms_free_ctxt(struct ldms_xprt *x, struct ldms_context *ctxt);
+#include "ldms_private.h"
 
 /* ========================
  * ==== LDMS_XPRT_AUTH ====
@@ -202,26 +198,6 @@ out:
 int ldms_access_check(ldms_t x, uint32_t acc, uid_t obj_uid, gid_t obj_gid,
 		      int obj_perm)
 {
-	int macc = acc & obj_perm;
-	/* root can do anything */
-	if (x->ruid == 0)
-		return 0;
-	/* other */
-	if (07 & macc) {
-		return 0;
-	}
-	/* owner */
-	if (0700 & macc) {
-		if (x->ruid == obj_uid)
-			return 0;
-	}
-	/* group  */
-	if (070 & macc) {
-		if (x->rgid == obj_gid)
-			return 0;
-		/* else need to check x->ruid group list */
-		if (0 == __uid_gid_check(x->ruid, obj_gid))
-			return 0;
-	}
-	return EACCES;
+	return ovis_access_check(x->ruid, x->rgid, acc,
+				obj_uid, obj_gid, obj_perm);
 }

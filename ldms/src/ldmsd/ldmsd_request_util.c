@@ -92,12 +92,14 @@ const struct req_str_id req_str_id_table[] = {
 	{  "prdcr_set_status",   LDMSD_PRDCR_SET_REQ  },
 	{  "prdcr_start",        LDMSD_PRDCR_START_REQ  },
 	{  "prdcr_start_regex",  LDMSD_PRDCR_START_REGEX_REQ  },
+	{  "prdcr_stats",        LDMSD_PRDCR_STATS_REQ  },
 	{  "prdcr_status",       LDMSD_PRDCR_STATUS_REQ  },
 	{  "prdcr_stop",         LDMSD_PRDCR_STOP_REQ  },
 	{  "prdcr_stop_regex",   LDMSD_PRDCR_STOP_REGEX_REQ  },
 	{  "prdcr_subscribe",    LDMSD_PRDCR_SUBSCRIBE_REQ },
 	{  "prdcr_unsubscribe",  LDMSD_PRDCR_UNSUBSCRIBE_REQ },
 	{  "set_route",          LDMSD_SET_ROUTE_REQ  },
+	{  "set_stats",          LDMSD_SET_STATS_REQ  },
 	{  "setgroup_add",       LDMSD_SETGROUP_ADD_REQ  },
 	{  "setgroup_del",       LDMSD_SETGROUP_DEL_REQ  },
 	{  "setgroup_ins",       LDMSD_SETGROUP_INS_REQ  },
@@ -114,7 +116,9 @@ const struct req_str_id req_str_id_table[] = {
 	{  "strgp_start",        LDMSD_STRGP_START_REQ  },
 	{  "strgp_status",       LDMSD_STRGP_STATUS_REQ  },
 	{  "strgp_stop",         LDMSD_STRGP_STOP_REQ  },
+	{  "subscribe",          LDMSD_STREAM_SUBSCRIBE_REQ  },
 	{  "term",               LDMSD_PLUGN_TERM_REQ  },
+	{  "thread_stats",       LDMSD_THREAD_STATS_REQ  },
 	{  "udata",              LDMSD_SET_UDATA_REQ  },
 	{  "udata_regex",        LDMSD_SET_UDATA_REGEX_REQ  },
 	{  "updtr_add",          LDMSD_UPDTR_ADD_REQ  },
@@ -129,6 +133,7 @@ const struct req_str_id req_str_id_table[] = {
 	{  "updtr_task",         LDMSD_UPDTR_TASK_REQ  },
 	{  "usage",              LDMSD_PLUGN_LIST_REQ  },
 	{  "version",            LDMSD_VERSION_REQ  },
+	{  "xprt_stats",         LDMSD_XPRT_STATS_REQ  },
 };
 
 /* This table need to be sorted by keyword for bsearch() */

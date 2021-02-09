@@ -46,7 +46,7 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-
+#define _GNU_SOURCE
 #include <sys/errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,17 +80,6 @@
 	(elm)->link.le_next = 0; \
 	(elm)->link.le_prev = 0; \
 } while(0)
-
-static int __set_sockbuf_sz(int sockfd)
-{
-	int rc;
-	size_t optval = UGNI_SOCKBUF_SZ;
-	rc = setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &optval, sizeof(optval));
-	if (rc)
-		return rc;
-	rc = setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &optval, sizeof(optval));
-	return rc;
-}
 
 static char *format_4tuple(struct zap_ep *ep, char *str, size_t len)
 {
@@ -227,11 +216,17 @@ static int zap_ugni_stalled_timeout;
 static LIST_HEAD(, z_ugni_ep) deferred_list = LIST_HEAD_INITIALIZER(0);
 static pthread_mutex_t deferred_list_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t ugni_io_count = 0;
-static uint32_t ugni_post_count = 0;
 #endif /* DEBUG */
+static uint32_t ugni_post_count;
+static uint32_t ugni_leaked_count;
+static uint32_t ugni_post_max;
+static uint32_t ugni_post_id;
+static gni_cq_handle_t ugni_old_cq; /* CQ replaced due to leaking descriptors */
 
 static pthread_mutex_t ugni_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t inst_id_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t cq_full_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cq_full_cond = PTHREAD_COND_INITIALIZER;
 
 static int zap_ugni_dom_initialized = 0;
 static struct zap_ugni_dom {
@@ -277,6 +272,43 @@ const char *zap_ugni_type_str(zap_ugni_type_t type)
 	return __zap_ugni_type_str[type];
 }
 
+/*
+ * Use KEEP-ALIVE packets to shut down a connection if the remote peer fails
+ * to respond for 10 minutes
+ */
+#define ZAP_SOCK_KEEPCNT	3	/* Give up after 3 failed probes */
+#define ZAP_SOCK_KEEPIDLE	10	/* Start probing after 10s of inactivity */
+#define ZAP_SOCK_KEEPINTVL	2	/* Probe couple seconds after idle */
+
+static int __set_keep_alive(int sock)
+{
+	int rc;
+	int optval;
+
+	optval = ZAP_SOCK_KEEPCNT;
+	rc = setsockopt(sock, SOL_TCP, TCP_KEEPCNT, &optval, sizeof(int));
+
+	optval = ZAP_SOCK_KEEPIDLE;
+	rc = setsockopt(sock, SOL_TCP, TCP_KEEPIDLE, &optval, sizeof(int));
+
+	optval = ZAP_SOCK_KEEPINTVL;
+	rc = setsockopt(sock, SOL_TCP, TCP_KEEPINTVL, &optval, sizeof(int));
+
+	optval = 1;
+	rc = setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(int));
+	return rc;
+}
+
+static int __set_sockbuf_sz(int sockfd)
+{
+	int rc;
+	size_t optval = UGNI_SOCKBUF_SZ;
+	rc = setsockopt(sockfd, SOL_SOCKET, SO_SNDBUF, &optval, sizeof(optval));
+	if (rc)
+		return rc;
+	rc = setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, &optval, sizeof(optval));
+	return rc;
+}
 static int __sock_nonblock(int fd)
 {
 	int rc;
@@ -460,6 +492,20 @@ void z_ugni_cleanup(void)
 		free(zap_ugni_ep_id);
 }
 
+static void __ep_release(struct z_ugni_ep *uep)
+{
+	gni_return_t grc;
+	if (uep->gni_ep) {
+		grc = GNI_EpUnbind(uep->gni_ep);
+		if (grc)
+			LOG_(uep, "GNI_EpUnbind() error: %s\n", gni_ret_str(grc));
+		grc = GNI_EpDestroy(uep->gni_ep);
+		if (grc != GNI_RC_SUCCESS)
+			LOG_(uep, "GNI_EpDestroy() error: %s\n", gni_ret_str(grc));
+		uep->gni_ep = NULL;
+	}
+}
+
 static zap_err_t z_ugni_close(zap_ep_t ep)
 {
 	struct z_ugni_ep *uep = (struct z_ugni_ep *)ep;
@@ -467,11 +513,11 @@ static zap_err_t z_ugni_close(zap_ep_t ep)
 	DLOG_(uep, "Closing xprt: %p, state: %s\n", uep,
 			__zap_ep_state_str(uep->ep.state));
 	pthread_mutex_lock(&uep->ep.lock);
+	uep->ep.state = ZAP_EP_CLOSE;
 	switch (uep->ep.state) {
 	case ZAP_EP_LISTENING:
 	case ZAP_EP_CONNECTED:
 	case ZAP_EP_PEER_CLOSE:
-		uep->ep.state = ZAP_EP_CLOSE;
 		shutdown(uep->sock, SHUT_RDWR);
 		break;
 	case ZAP_EP_ERROR:
@@ -537,7 +583,14 @@ static zap_err_t z_ugni_connect(zap_ep_t ep,
 
 	if (__set_sockbuf_sz(uep->sock)) {
 		zerr = ZAP_ERR_TRANSPORT;
-		LOG_(uep, "Error %d: fail to set the sockbuf sz in %s.\n",
+		LOG_(uep, "Error %d: setting the sockbuf sz in %s.\n",
+				errno, __func__);
+		goto out;
+	}
+
+	if (__set_keep_alive(uep->sock)) {
+		zerr = ZAP_ERR_TRANSPORT;
+		LOG_(uep, "Error %d: enabling keep-alive in %s.\n",
 				errno, __func__);
 		goto out;
 	}
@@ -715,7 +768,6 @@ static void process_uep_msg_accepted(struct z_ugni_ep *uep)
 			"%s: Unexpected state '%s'. "
 			"Expected state 'ZAP_EP_CONNECTING'\n",
 			__func__, __zap_ep_state_str(uep->ep.state));
-	struct zap_event ev;
 	struct zap_ugni_msg_accepted *msg;
 	zap_err_t zerr;
 
@@ -757,9 +809,11 @@ static void process_uep_msg_accepted(struct z_ugni_ep *uep)
 #endif /* ZAP_UGNI_DEBUG */
 
 	uep->ugni_ep_bound = 1;
-	ev.type = ZAP_EVENT_CONNECTED;
-	ev.data_len = msg->data_len;
-	ev.data = (msg->data_len)?((void*)msg->data):(NULL);
+	struct zap_event ev = {
+		.type = ZAP_EVENT_CONNECTED,
+		.data_len = msg->data_len,
+		.data = (msg->data_len ? (void*)msg->data : NULL)
+	};
 	if (!zap_ep_change_state(&uep->ep, ZAP_EP_CONNECTING, ZAP_EP_CONNECTED)) {
 		uep->ep.cb((void*)uep, &ev);
 	} else {
@@ -777,7 +831,6 @@ err:
 static void process_uep_msg_connect(struct z_ugni_ep *uep)
 {
 	struct zap_ugni_msg_connect *msg;
-	struct zap_event ev;
 
 	msg = (void*)uep->rbuff->data;
 
@@ -817,9 +870,11 @@ static void process_uep_msg_connect(struct z_ugni_ep *uep)
 	uep->ugni_ep_bound = 1;
 	pthread_mutex_unlock(&uep->ep.lock);
 
-	ev.type = ZAP_EVENT_CONNECT_REQUEST;
-	ev.data_len = msg->data_len;
-	ev.data = (msg->data_len)?((void*)msg->data):(NULL);
+	struct zap_event ev = {
+		.type = ZAP_EVENT_CONNECT_REQUEST,
+		.data_len = msg->data_len,
+		.data = (msg->data_len)?((void*)msg->data):(NULL)
+	};
 	uep->ep.cb(&uep->ep, &ev);
 
 	return;
@@ -832,15 +887,16 @@ err1:
 static void process_uep_msg_rejected(struct z_ugni_ep *uep)
 {
 	struct zap_ugni_msg_regular *msg;
-	struct zap_event ev;
 	int rc;
+	size_t data_len;
 
 	msg = (void*)uep->rbuff->data;
-
-	ev.type = ZAP_EVENT_REJECTED;
-	ev.status = ZAP_ERR_OK;
-	ev.data_len = ntohl(msg->data_len);
-	ev.data = (ev.data_len)?((void*)msg->data):(NULL);
+	data_len = ntohl(msg->data_len);
+	struct zap_event ev = {
+		.type = ZAP_EVENT_REJECTED,
+		.data_len = data_len,
+		.data = (data_len ? (void *)msg->data : NULL)
+	};
 	rc = zap_ep_change_state(&uep->ep, ZAP_EP_CONNECTING, ZAP_EP_ERROR);
 	if (rc != ZAP_ERR_OK) {
 		return;
@@ -860,8 +916,7 @@ static void process_uep_msg_ack_accepted(struct z_ugni_ep *uep)
 		return;
 	}
 	struct zap_event ev = {
-		.type = ZAP_EVENT_CONNECTED,
-		.status = ZAP_ERR_OK,
+		.type = ZAP_EVENT_CONNECTED
 	};
 	zap_get_ep(&uep->ep); /* Release when receive disconnect/error event */
 	uep->ep.cb(&uep->ep, &ev);
@@ -898,6 +953,8 @@ static int __recv_msg(struct z_ugni_ep *uep)
 			goto err;
 		}
 		if (rsz < 0) {
+			if (errno == EAGAIN)
+				return errno;
 			/* error */
 			rc = errno;
 			from_line = __LINE__;
@@ -945,6 +1002,8 @@ static int __recv_msg(struct z_ugni_ep *uep)
 			goto err;
 		}
 		if (rsz < 0) {
+			if (errno == EAGAIN)
+				return errno;
 			rc = errno;
 			from_line = __LINE__;
 			goto err;
@@ -1079,11 +1138,13 @@ int zap_ugni_err_handler(gni_cq_handle_t cq, gni_cq_entry_t cqe,
 
 static gni_return_t process_cq(gni_cq_handle_t cq, gni_cq_entry_t cqe_)
 {
+	struct zap_event zev;
 	gni_cq_entry_t cqe = cqe_;
 	gni_return_t grc;
 	gni_post_descriptor_t *post;
 	int count = 0;
 	do {
+		memset(&zev, 0, sizeof(zev));
 		count++;
 		if (GNI_CQ_GET_TYPE(cqe) != GNI_CQ_EVENT_TYPE_POST) {
 			zap_ugni_log("Unexepcted cqe type %d cqe"
@@ -1104,12 +1165,10 @@ static gni_return_t process_cq(gni_cq_handle_t cq, gni_cq_entry_t cqe_)
 			DLOG("process_cq: post is NULL\n");
 			goto skip;
 		}
-#ifdef DEBUG
-		assert(ugni_post_count >= 0);
-		__sync_sub_and_fetch(&ugni_post_count, 1);
-#endif /* DEBUG */
+		assert((int)ugni_post_count >= 0);
 		struct zap_ugni_post_desc *desc = (void*) post;
 		if (grc) {
+			zap_ugni_log("GNI_GetCompleted returned %s\n", gni_ret_str(grc));
 			if (0 == zap_ugni_err_handler(cq, cqe, desc))
 				__shutdown_on_error(desc->uep);
 			else
@@ -1124,7 +1183,7 @@ static gni_return_t process_cq(gni_cq_handle_t cq, gni_cq_entry_t cqe_)
 			 * has been flushed. The corresponding endpoint
 			 * might have been freed already.
 			 */
-			LOG("%s: Received a complete event of a stalled post "
+			LOG("%s: Received a CQ event for a stalled post "
 						"desc.\n", desc->ep_name);
 			ZUGNI_LIST_REMOVE(desc, stalled_link);
 			free(desc);
@@ -1148,14 +1207,12 @@ static gni_return_t process_cq(gni_cq_handle_t cq, gni_cq_entry_t cqe_)
 		if (uep->deferred_link.le_prev)
 			LOG_(uep, "uep %p: Doh!! I'm on the deferred list.\n", uep);
 #endif /* DEBUG */
-		struct zap_event zev = {0};
 		switch (desc->post.type) {
 		case GNI_POST_RDMA_GET:
-			DLOG_(uep, "RDMA_GET: Read complete %p with %s\n",
-						desc, gni_ret_str(grc));
+			DLOG_(uep, "RDMA_GET: Read complete %p with %s\n", desc, gni_ret_str(grc));
 			if (grc) {
 				zev.status = ZAP_ERR_RESOURCE;
-				DLOG_(uep, "RDMA_GET: completing "
+				LOG_(uep, "RDMA_GET: completing "
 					"with error %s.\n",
 					gni_ret_str(grc));
 			}
@@ -1163,7 +1220,7 @@ static gni_return_t process_cq(gni_cq_handle_t cq, gni_cq_entry_t cqe_)
 			zev.context = desc->context;
 			break;
 		case GNI_POST_RDMA_PUT:
-			DLOG_(uep, "RDMA_GET: Read complete %p with %s\n",
+			DLOG_(uep, "RDMA_PUT: Write complete %p with %s\n",
 						desc, gni_ret_str(grc));
 			if (grc) {
 				zev.status = ZAP_ERR_RESOURCE;
@@ -1184,14 +1241,24 @@ static gni_return_t process_cq(gni_cq_handle_t cq, gni_cq_entry_t cqe_)
 		pthread_mutex_unlock(&uep->ep.lock);
 		pthread_mutex_unlock(&z_ugni_list_mutex);
 
+		/* Wake up threads blocked trying to post descriptors */
+		pthread_mutex_lock(&cq_full_lock);
+		if (uep->gni_cq == _dom.cq) {
+			__sync_sub_and_fetch(&ugni_post_count, 1);
+			assert((int)ugni_post_count >= 0);
+		}
+		pthread_cond_broadcast(&cq_full_cond);
+		pthread_mutex_unlock(&cq_full_lock);
+
 		uep->ep.cb(&uep->ep, &zev);
 	skip:
 		pthread_mutex_lock(&ugni_lock);
 		grc = GNI_CqGetEvent(cq, &cqe);
+		pthread_mutex_unlock(&ugni_lock);
 		if (grc == GNI_RC_ERROR_RESOURCE) {
 			zap_ugni_log("CQ overrun!\n");
+			break;
 		}
-		pthread_mutex_unlock(&ugni_lock);
 	} while (grc != GNI_RC_NOT_DONE);
 	if (count > 1)
 		DLOG("process_cq: count %d\n", count);
@@ -1205,6 +1272,7 @@ void __stall_post_desc(struct zap_ugni_post_desc *d, struct timeval time)
 	d->is_stalled = 1;
 	d->uep = NULL;
 	d->stalled_time = time;
+	__sync_fetch_and_add(&ugni_leaked_count, 1);
 	LIST_INSERT_HEAD(&stalled_desc_list, d, stalled_link);
 }
 
@@ -1234,23 +1302,32 @@ void __flush_post_desc_list(struct z_ugni_ep *uep)
 		zev.context = d->context;
 		pthread_mutex_unlock(&uep->ep.lock);
 		uep->ep.cb(&uep->ep, &zev);
+		if (uep->gni_cq == _dom.cq) {
+			__sync_sub_and_fetch(&ugni_post_count, 1);
+			assert((int)ugni_post_count >= 0);
+		}
 		pthread_mutex_lock(&uep->ep.lock);
 		__stall_post_desc(d, time);
 		d = LIST_FIRST(&uep->post_desc_list);
 	}
 }
 
+static zap_thrstat_t ugni_stats;
 #define WAIT_5SECS 5000
 static void *cq_thread_proc(void *arg)
 {
 	gni_return_t grc;
 	gni_cq_entry_t cqe;
 	int oldtype;
+	int drain = 0;
 
 	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, &oldtype);
+	zap_thrstat_reset(ugni_stats);
 	while (1) {
-		uint64_t timeout = -1; /* WAIT_5SECS; */
+		uint64_t timeout = WAIT_5SECS;
+		zap_thrstat_wait_start(ugni_stats);
 		grc = GNI_CqWaitEvent(_dom.cq, timeout, &cqe);
+		zap_thrstat_wait_end(ugni_stats);
 		switch (grc) {
 		case GNI_RC_SUCCESS:
 			grc = process_cq(_dom.cq, cqe);
@@ -1258,11 +1335,44 @@ static void *cq_thread_proc(void *arg)
 				zap_ugni_log("Error %d processing CQ %p.\n",
 					     grc, _dom.cq);
 		case GNI_RC_TIMEOUT:
+			if (drain) {
+				gni_cq_handle_t new_cq;
+				grc = GNI_CqCreate(_dom.nic, _dom.cq_depth, 0, GNI_CQ_BLOCKING,
+						   NULL, NULL, &new_cq);
+				if (grc == GNI_RC_SUCCESS) {
+					ugni_old_cq = _dom.cq;
+					_dom.cq = new_cq;
+					ugni_post_count = 0;
+					ugni_leaked_count = 0;
+					drain = 0;
+					zap_ugni_log("%s: Created a new CQ...resuming I/O\n", __func__);
+				} else {
+					zap_ugni_log("%s: Creating a new CQ failed with error \"%s\". "
+						     "The daemon needs to be restarted\n",
+						     __func__, gni_ret_str(grc));
+					pthread_mutex_unlock(&cq_full_lock);
+				}
+				pthread_mutex_unlock(&cq_full_lock);
+			}
 			break;
 		default:
 			zap_ugni_log("%s:%d GNI_CqWaitEvent returned %s, errno %d\n",
 				     __func__, __LINE__, gni_ret_str(grc), errno);
 			break;
+		}
+		/*
+		 * Check if the leaked descriptor count is > 1/2 the
+		 * cq depth. At that point:
+		 * - Stall all I/O (by holding the cq_full_lock)
+		 * - Wait up to 5 seconds to drain the CQ
+		 * - Create a new CQ and continue
+		 */
+		if ((drain == 0)
+		    && (ugni_leaked_count > (_dom.cq_depth / 2))) {
+			pthread_mutex_lock(&cq_full_lock);
+			drain = 1;
+			zap_ugni_log("%s: CQ has leaked %d descriptors...stalling I/O\n", __func__,
+				     ugni_leaked_count);
 		}
 	}
 	return NULL;
@@ -1270,12 +1380,12 @@ static void *cq_thread_proc(void *arg)
 
 static void *error_thread_proc(void *args)
 {
-        gni_err_handle_t err_hndl;
-        gni_error_event_t ev;
-        gni_return_t status;
-        uint32_t num;
+	gni_err_handle_t err_hndl;
+	gni_error_event_t ev;
+	gni_return_t status;
+	uint32_t num;
 
-        gni_error_mask_t err =
+	gni_error_mask_t err =
 		GNI_ERRMASK_CORRECTABLE_MEMORY |
 		GNI_ERRMASK_CRITICAL |
 		GNI_ERRMASK_TRANSACTION |
@@ -1289,6 +1399,7 @@ static void *error_thread_proc(void *args)
 		zap_ugni_log("FAIL:GNI_SubscribeErrors returned error %s\n", gni_err_str[status]);
 	}
 	while (1) {
+		memset(&ev, 0, sizeof(ev));
 		status = GNI_WaitErrorEvents(err_hndl,&ev,1,0,&num);
 		if (status != GNI_RC_SUCCESS || (num != 1)) {
 			zap_ugni_log("FAIL:GNI_WaitErrorEvents returned error %d %s\n",
@@ -1381,21 +1492,11 @@ __ugni_send(struct z_ugni_ep *uep, enum zap_ugni_msg_type type,
 
 static void __deliver_disconnect_ev(struct z_ugni_ep *uep)
 {
-	/* Make certain we release the NTT resources */
-	while (uep->ugni_ep_bound) {
-		gni_return_t grc = GNI_EpUnbind(uep->gni_ep);
-		if (grc != GNI_RC_NOT_DONE)
-			break;
-		zap_ugni_log("%s: GNI_EpUnbind returns GNI_RC_NOT_DONE...retrying\n");
-		sleep(1);
-	}
-
 	/* Deliver the disconnected event */
 	pthread_mutex_lock(&z_ugni_list_mutex);
 #ifdef DEBUG
 	zap_ugni_ep_id[uep->ep_id] = -1;
 #endif /* DEBUG */
-
 	pthread_mutex_lock(&uep->ep.lock);
 #ifdef DEBUG
 	/* It is in the queue already. */
@@ -1528,6 +1629,9 @@ static void ugni_sock_event(ovis_event_t ev)
 
 	/* Reaching here means bev is one of the EOF, ERROR or TIMEOUT */
 	pthread_mutex_lock(&uep->ep.lock);
+	int defer = 0;
+	if (!LIST_EMPTY(&uep->post_desc_list))
+		defer = 1;
 	rc = ovis_scheduler_event_del(io_sched, ev);
 	assert(rc == 0); /* ev must be in the scheduler, otherwise it is a bug */
 	switch (uep->ep.state) {
@@ -1563,24 +1667,12 @@ static void ugni_sock_event(ovis_event_t ev)
 	}
 	DLOG_(uep, "%s: ep %p: state %s\n", __func__, uep,
 				__zap_ep_state_str[uep->ep.state]);
-	int defer = 0;
-	if (uep->ugni_ep_bound) {
-		gni_return_t grc = GNI_EpUnbind(uep->gni_ep);
-		if (grc)
-			DLOG_(uep, "GNI_EpUnbind() error: %s\n", gni_ret_str(grc));
-		if (grc == GNI_RC_NOT_DONE)
-			defer = 1;
-		else
-			uep->ugni_ep_bound = 0;
-	}
-	if (!LIST_EMPTY(&uep->post_desc_list))
-		defer = 1;
 	pthread_mutex_unlock(&uep->ep.lock);
 	if (defer) {
 		/*
-		 * Defer to give time to uGNI to flush the outstanding
-		 * completion events
-		 */
+		* Allow time for uGNI to flush outstanding
+		* completion events
+		*/
 		__ugni_defer_disconnect_event(uep);
 	} else {
 		__deliver_disconnect_ev(uep);
@@ -1798,7 +1890,7 @@ static zap_err_t z_ugni_send(zap_ep_t ep, char *buf, size_t len)
 	}
 
 	pthread_mutex_lock(&uep->ep.lock);
-	if (ep->state != ZAP_EP_CONNECTED) {
+	if (!uep->gni_ep || ep->state != ZAP_EP_CONNECTED) {
 		pthread_mutex_unlock(&uep->ep.lock);
 		return ZAP_ERR_NOT_CONNECTED;
 	}
@@ -1818,10 +1910,8 @@ static void stalled_timeout_cb(ovis_event_t ev)
 	gettimeofday(&now, NULL);
 	desc = LIST_FIRST(&stalled_desc_list);
 	while (desc) {
-#if 0
 		zap_ugni_log("%s: %s: Freeing stalled post desc:\n",
 			__func__, desc->ep_name);
-#endif
 		if (zap_ugni_stalled_timeout <= now.tv_sec - desc->stalled_time.tv_sec) {
 			ZUGNI_LIST_REMOVE(desc, stalled_link);
 			free(desc);
@@ -1829,6 +1919,22 @@ static void stalled_timeout_cb(ovis_event_t ev)
 			break;
 		}
 		desc = LIST_FIRST(&stalled_desc_list);
+	}
+	if (ugni_old_cq) {
+		/*
+		 * Attempt to cleanup the CQ that was replaced. This
+		 * will fail until all endpoints associated with the
+		 * old CQ are destroyed
+		 */
+		gni_return_t grc = GNI_CqDestroy(ugni_old_cq);
+		if (grc == GNI_RC_SUCCESS) {
+			zap_ugni_log("%s: Successfully destroyed old CQ\n",
+				     __func__);
+			ugni_old_cq = NULL;
+		} else {
+			zap_ugni_log("%s: Error %s destroying old CQ\n",
+				     __func__, gni_ret_str(grc));
+		}
 	}
 	pthread_mutex_unlock(&z_ugni_list_mutex);
 }
@@ -2092,6 +2198,7 @@ static int ugni_node_state_thread_init()
 	rc = pthread_create(&node_state_thread, NULL, node_state_proc, NULL);
 	if (rc)
 		return rc;
+	pthread_setname_np(node_state_thread, "ugni:node_state");
 	return 0;
 }
 
@@ -2190,9 +2297,19 @@ static int z_ugni_init()
 				goto out;
 			}
 		}
-
+		uint32_t fma_mode;
+		int dedicated;
+		char *dedicated_s = getenv("ZAP_UGNI_FMA_DEDICATED");
+		if (dedicated_s)
+			dedicated = atoi(dedicated_s);
+		else
+			dedicated = 0;
+		if (dedicated)
+			fma_mode = GNI_CDM_MODE_FMA_DEDICATED;
+		else
+			fma_mode = GNI_CDM_MODE_FMA_SHARED;
 		grc = GNI_CdmCreate(_dom.inst_id, _dom.ptag, _dom.cookie,
-				GNI_CDM_MODE_FMA_SHARED, &_dom.cdm);
+				    fma_mode, &_dom.cdm);
 		if (grc) {
 			LOG("ERROR: GNI_CdmCreate() failed: %s\n",
 					gni_ret_str(grc));
@@ -2226,11 +2343,13 @@ static int z_ugni_init()
 		LOG("ERROR: pthread_create() failed: %d\n", rc);
 		goto out;
 	}
+	pthread_setname_np(cq_thread, "ugni:cq_proc");
 	zap_ugni_dom_initialized = 1;
 	rc = pthread_create(&error_thread, NULL, error_thread_proc, NULL);
 	if (rc) {
 		LOG("ERROR: pthread_create() failed: %d\n", rc);
 	}
+	pthread_setname_np(error_thread, "ugni:error");
 out:
 	pthread_mutex_unlock(&ugni_lock);
 	return rc;
@@ -2240,6 +2359,7 @@ int init_once()
 {
 	int rc = ENOMEM;
 
+	ugni_stats = zap_thrstat_new("ugni:cq_proc", ZAP_ENV_INT(ZAP_THRSTAT_WINDOW));
 	rc = ugni_node_state_thread_init();
 	if (rc)
 		return rc;
@@ -2337,6 +2457,7 @@ zap_ep_t z_ugni_new(zap_t z, zap_cb_fn_t cb)
 	}
 	uep->sock = -1;
 	uep->ep_id = -1;
+	uep->gni_cq = _dom.cq;
 
 	uep->rbuff = malloc(ZAP_UGNI_INIT_RECV_BUFF_SZ);
 	if (!uep->rbuff)
@@ -2384,7 +2505,6 @@ err0:
 static void z_ugni_destroy(zap_ep_t ep)
 {
 	struct z_ugni_ep *uep = (void*)ep;
-	gni_return_t grc;
 	struct zap_ugni_send_wr *wr;
 	DLOG_(uep, "destroying endpoint %p\n", uep);
 	pthread_mutex_lock(&z_ugni_list_mutex);
@@ -2412,12 +2532,7 @@ static void z_ugni_destroy(zap_ep_t ep)
 		close(uep->sock);
 		uep->sock = -1;
 	}
-	if (uep->gni_ep) {
-		DLOG_(uep, "Destroying gni_ep: %p\n", uep->gni_ep);
-		grc = GNI_EpDestroy(uep->gni_ep);
-		if (grc)
-			LOG_(uep, "GNI_EpDestroy() error: %s\n", gni_ret_str(grc));
-	}
+	__ep_release(uep);
 	free(ep);
 }
 
@@ -2591,6 +2706,8 @@ static zap_err_t z_ugni_read(zap_ep_t ep, zap_map_t src_map, char *src,
 			     zap_map_t dst_map, char *dst, size_t sz,
 			     void *context)
 {
+	zap_err_t zerr;
+
 	if (((uint64_t)src) & 3)
 		return ZAP_ERR_PARAMETER;
 	if (((uint64_t)dst) & 3)
@@ -2629,17 +2746,29 @@ static zap_err_t z_ugni_read(zap_ep_t ep, zap_map_t src_map, char *src,
 		}
 	}
 
+	pthread_mutex_lock(&cq_full_lock);
+	while (ugni_post_count > _dom.cq_depth / 2) {
+		struct timespec timeout;
+		clock_gettime(CLOCK_REALTIME, &timeout);
+		timeout.tv_sec += 1;
+		pthread_cond_timedwait(&cq_full_cond, &cq_full_lock, &timeout);
+	}
+	__sync_fetch_and_add(&ugni_post_count, 1);
+	if (ugni_post_count > ugni_post_max)
+		ugni_post_max = ugni_post_count;
+	pthread_mutex_unlock(&cq_full_lock);
+
 	pthread_mutex_lock(&ep->lock);
-	if (ep->state != ZAP_EP_CONNECTED) {
-		pthread_mutex_unlock(&ep->lock);
-		return ZAP_ERR_ENDPOINT;
+	if (!uep->gni_ep || ep->state != ZAP_EP_CONNECTED) {
+		zerr = ZAP_ERR_NOT_CONNECTED;
+		goto out;
 	}
 
 	gni_return_t grc;
 	struct zap_ugni_post_desc *desc = __alloc_post_desc(uep);
 	if (!desc) {
-		pthread_mutex_unlock(&ep->lock);
-		return ZAP_ERR_RESOURCE;
+		zerr = ZAP_ERR_RESOURCE;
+		goto out;
 	}
 
 	desc->post.type = GNI_POST_RDMA_GET;
@@ -2650,45 +2779,52 @@ static zap_err_t z_ugni_read(zap_ep_t ep, zap_map_t src_map, char *src,
 	desc->post.remote_addr = (uint64_t)src;
 	desc->post.remote_mem_hndl = smap->gni_mh;
 	desc->post.length = sz;
-	/*
-	 * We can track the posted rdma using
-	 * the returned gni_post_descriptor_t address.
-	 *
-	 * We abuse the post_id field to store the endpoint context
-	 * so that we can check at the completion time
-	 * whether the endpoint still exists or not.
-	 */
-#ifdef DEBUG
-	desc->post.post_id = uep->ep_id;
-#endif /* DEBUG */
-	desc->context = context;
-	pthread_mutex_unlock(&ep->lock);
+	desc->post.post_id = __sync_fetch_and_add(&ugni_post_id, 1);
 
-	pthread_mutex_lock(&ugni_lock);
+	desc->context = context;
 #ifdef DEBUG
 	__sync_fetch_and_add(&ugni_io_count, 1);
-	__sync_fetch_and_add(&ugni_post_count, 1);
 #endif /* DEBUG */
-	grc = GNI_PostRdma(uep->gni_ep, &desc->post);
+
+	pthread_mutex_lock(&ugni_lock);
+	if (uep->gni_cq == _dom.cq)
+		grc = GNI_PostRdma(uep->gni_ep, &desc->post);
+	else
+		grc = GNI_RC_ERROR_RESOURCE;
 	if (grc != GNI_RC_SUCCESS) {
 		LOG_(uep, "%s: GNI_PostRdma() failed, grc: %s\n",
 				__func__, gni_ret_str(grc));
+		__shutdown_on_error(uep);
 #ifdef DEBUG
 		__sync_sub_and_fetch(&ugni_io_count, 1);
-		__sync_sub_and_fetch(&ugni_post_count, 1);
 #endif /* DEBUG */
 		__free_post_desc(desc);
+		zerr = ZAP_ERR_RESOURCE;
 		pthread_mutex_unlock(&ugni_lock);
-		return ZAP_ERR_RESOURCE;
+		goto out;
 	}
 	pthread_mutex_unlock(&ugni_lock);
-	return ZAP_ERR_OK;
+	zerr = ZAP_ERR_OK;
+ out:
+	pthread_mutex_unlock(&ep->lock);
+	if (zerr) {
+		/* Return the CQ credit */
+		pthread_mutex_lock(&cq_full_lock);
+		__sync_sub_and_fetch(&ugni_post_count, 1);
+		assert((int)ugni_post_count >= 0);
+		pthread_cond_broadcast(&cq_full_cond);
+		pthread_mutex_unlock(&cq_full_lock);
+	}
+	return zerr;
 }
 
 static zap_err_t z_ugni_write(zap_ep_t ep, zap_map_t src_map, char *src,
 			      zap_map_t dst_map, char *dst, size_t sz,
 			      void *context)
 {
+	gni_return_t grc;
+	zap_err_t zerr;
+
 	if (((uint64_t)src) & 3)
 		return ZAP_ERR_PARAMETER;
 	if (((uint64_t)dst) & 3)
@@ -2704,7 +2840,6 @@ static zap_err_t z_ugni_write(zap_ep_t ep, zap_map_t src_map, char *src,
 	struct z_ugni_ep *uep = (void*)ep;
 	struct zap_ugni_map *smap = (void*)src_map;
 	struct zap_ugni_map *dmap = (void*)dst_map;
-	gni_return_t grc;
 
 	/* node state validation */
 	if (_node_state.check_state) {
@@ -2728,16 +2863,28 @@ static zap_err_t z_ugni_write(zap_ep_t ep, zap_map_t src_map, char *src,
 		}
 	}
 
+	pthread_mutex_lock(&cq_full_lock);
+	while (ugni_post_count > _dom.cq_depth / 2) {
+		struct timespec timeout;
+		clock_gettime(CLOCK_REALTIME, &timeout);
+		timeout.tv_sec += 1;
+		pthread_cond_timedwait(&cq_full_cond, &cq_full_lock, &timeout);
+	}
+	__sync_fetch_and_add(&ugni_post_count, 1);
+	if (ugni_post_count > ugni_post_max)
+		ugni_post_max = ugni_post_count;
+	pthread_mutex_unlock(&cq_full_lock);
+
 	pthread_mutex_lock(&ep->lock);
-	if (ep->state != ZAP_EP_CONNECTED) {
-		pthread_mutex_unlock(&ep->lock);
-		return ZAP_ERR_ENDPOINT;
+	if (!uep->gni_ep || ep->state != ZAP_EP_CONNECTED) {
+		zerr = ZAP_ERR_NOT_CONNECTED;
+		goto out;
 	}
 
 	struct zap_ugni_post_desc *desc = __alloc_post_desc(uep);
 	if (!desc) {
-		pthread_mutex_unlock(&ep->lock);
-		return ZAP_ERR_ENDPOINT;
+		zerr = ZAP_ERR_RESOURCE;
+		goto out;
 	}
 
 	desc->post.type = GNI_POST_RDMA_PUT;
@@ -2748,29 +2895,42 @@ static zap_err_t z_ugni_write(zap_ep_t ep, zap_map_t src_map, char *src,
 	desc->post.remote_addr = (uint64_t)dst;
 	desc->post.remote_mem_hndl = dmap->gni_mh;
 	desc->post.length = sz;
-	desc->post.post_id = (uint64_t)(unsigned long)desc;
+	desc->post.post_id = __sync_fetch_and_add(&ugni_post_id, 1);
 	desc->context = context;
-	pthread_mutex_unlock(&ep->lock);
 
-	pthread_mutex_lock(&ugni_lock);
 #ifdef DEBUG
 	__sync_fetch_and_add(&ugni_io_count, 1);
-	__sync_fetch_and_add(&ugni_post_count, 1);
 #endif /* DEBUG */
-	grc = GNI_PostRdma(uep->gni_ep, &desc->post);
+	pthread_mutex_lock(&ugni_lock);
+	if (uep->gni_cq == _dom.cq)
+		grc = GNI_PostRdma(uep->gni_ep, &desc->post);
+	else
+		grc = GNI_RC_ERROR_RESOURCE;
 	if (grc != GNI_RC_SUCCESS) {
 		LOG_(uep, "%s: GNI_PostRdma() failed, grc: %s\n",
 				__func__, gni_ret_str(grc));
+		__shutdown_on_error(uep);
 #ifdef DEBUG
 		__sync_sub_and_fetch(&ugni_io_count, 1);
-		__sync_sub_and_fetch(&ugni_post_count, 1);
 #endif /* DEBUG */
 		__free_post_desc(desc);
+		zerr = ZAP_ERR_RESOURCE;
 		pthread_mutex_unlock(&ugni_lock);
-		return ZAP_ERR_RESOURCE;
+		goto out;
 	}
 	pthread_mutex_unlock(&ugni_lock);
-	return ZAP_ERR_OK;
+	zerr = ZAP_ERR_OK;
+out:
+	pthread_mutex_unlock(&ep->lock);
+	if (zerr) {
+		/* Return the CQ credit */
+		pthread_mutex_lock(&cq_full_lock);
+		__sync_sub_and_fetch(&ugni_post_count, 1);
+		assert((int)ugni_post_count >= 0);
+		pthread_cond_broadcast(&cq_full_cond);
+		pthread_mutex_unlock(&cq_full_lock);
+	}
+	return zerr;
 }
 
 zap_err_t zap_transport_get(zap_t *pz, zap_log_fn_t log_fn,
@@ -2778,10 +2938,8 @@ zap_err_t zap_transport_get(zap_t *pz, zap_log_fn_t log_fn,
 {
 	zap_t z;
 	size_t sendrecv_sz, rendezvous_sz;
-#if 0
 	if (log_fn)
 		zap_ugni_log = log_fn;
-#endif
 	if (!init_complete && init_once())
 		goto err;
 

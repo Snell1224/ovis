@@ -892,7 +892,8 @@ typedef enum ldms_xprt_ops_e {
 	LDMS_XPRT_OP_UPDATE,
 	LDMS_XPRT_OP_PUBLISH,
 	LDMS_XPRT_OP_SET_DELETE,
-	LDMS_XPRT_OP_DIR,
+	LDMS_XPRT_OP_DIR_REQ,
+	LDMS_XPRT_OP_DIR_REP,
 	LDMS_XPRT_OP_SEND,
 	LDMS_XPRT_OP_COUNT
 } ldms_xprt_ops_t;
@@ -905,14 +906,23 @@ struct ldms_xprt_rate_data {
 	double disconnect_rate_s;
 	double reject_rate_s;
 	double auth_fail_rate_s;
+	double duration;
 };
 
 /**
- * Retrieve transport rate data
+ * Query daemon telemetry data across transports
+ * 
+ * \param data A pointer to the ldms_xprt_rate_data structure in which
+ *             the results will be returned
+ * \param reset Set to a non-zero value to reset the stats after
+ *             after computing them.
  */
-void ldms_xprt_rate_data(struct ldms_xprt_rate_data *data);
+void ldms_xprt_rate_data(struct ldms_xprt_rate_data *data, int reset);
 
 typedef struct ldms_xprt_stats {
+	struct timespec connected;
+	struct timespec disconnected;
+	struct timespec last_op;
 	struct ldms_stats_entry ops[LDMS_XPRT_OP_COUNT];
 } *ldms_xprt_stats_t;
 
@@ -1000,6 +1010,17 @@ extern uint64_t ldms_set_id(ldms_set_t set);
 ldms_set_t ldms_set_new_with_auth(const char *instance_name,
 				  ldms_schema_t schema,
 				  uid_t uid, gid_t gid, mode_t perm);
+
+/**
+ * \brief Return the number of metric sets
+ * \returns The number of metric sets
+ */
+extern int ldms_set_count();
+/**
+ * \brief Return the number of sets pending deletion
+ * \returns The number of sets pending deletion
+ */
+extern int ldms_set_deleting_count();
 
 /**
  * \addtogroup ldms_set_config LDMS Set Configuration

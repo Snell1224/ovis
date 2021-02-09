@@ -289,7 +289,8 @@ typedef struct ldmsd_prdcr_set {
 		LDMSD_PRDCR_SET_STATE_START,
 		LDMSD_PRDCR_SET_STATE_LOOKUP,
 		LDMSD_PRDCR_SET_STATE_READY,
-		LDMSD_PRDCR_SET_STATE_UPDATING
+		LDMSD_PRDCR_SET_STATE_UPDATING,
+		LDMSD_PRDCR_SET_STATE_DELETED
 	} state;
 	uint64_t last_gn;
 	pthread_mutex_t lock;
@@ -810,7 +811,7 @@ extern ldmsctl_cmd_fn_t cmd_table[LDMSCTL_LAST_COMMAND + 1];
 #define LEN_ERRSTR 256
 #define LDMSD_ENOMEM_MSG "Memory allocation failure\n"
 
-void ldmsd_msg_logger(enum ldmsd_loglevel level, const char *fmt, ...);
+#define ldmsd_msg_logger ldmsd_log /* ldmsd_msg_logger is deprecated */
 int ldmsd_logrotate();
 int ldmsd_plugins_usage(const char *plugin_name);
 void ldmsd_mm_status(enum ldmsd_loglevel level, const char *prefix);
@@ -896,6 +897,8 @@ static inline const char *ldmsd_prdcr_set_state_str(enum ldmsd_prdcr_set_state s
 		return "READY";
 	case LDMSD_PRDCR_SET_STATE_UPDATING:
 		return "UPDATING";
+	case LDMSD_PRDCR_SET_STATE_DELETED:
+		return "DELETED";
 	}
 	return "BAD STATE";
 }
@@ -1221,7 +1224,7 @@ typedef struct ldmsd_auth {
 
 /* Key (name) of the default auth -- intentionally including SPACE as it is not
  * allowed in user-defined names */
-#define DEFAULT_AUTH " _DEFAULT_AUTH_ "
+#define DEFAULT_AUTH "auth_default"
 
 ldmsd_auth_t
 ldmsd_auth_new_with_auth(const char *name, const char *plugin,
