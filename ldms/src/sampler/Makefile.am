@@ -3,6 +3,7 @@ ACLOCAL_AMFLAGS = -I m4
 SUBDIRS = .
 lib_LTLIBRARIES =
 pkglib_LTLIBRARIES =
+noinst_LTLIBRARIES =
 
 AM_CPPFLAGS = @OVIS_INCLUDE_ABS@
 AM_LDFLAGS = @OVIS_LIB_ABS@
@@ -13,6 +14,14 @@ CORE_LIBADD = $(top_builddir)/ldms/src/core/libldms.la \
 COMMON_LIBADD = libsampler_base.la $(CORE_LIBADD) \
 		$(top_builddir)/lib/src/coll/libcoll.la
 
+noinst_LTLIBRARIES += libldms_compid_helper.la
+libldms_compid_helper_la_SOURCES = comp_id_helper.c comp_id_helper.h
+libldms_compid_helper_la_LIBADD = $(CORE_LIBADD)
+
+noinst_LTLIBRARIES += libjobid_helper.la
+libjobid_helper_la_SOURCES = jobid_helper.c jobid_helper.h
+libjobid_helper_la_LIBADD = $(CORE_LIBADD) $(top_builddir)/lib/src/coll/libcoll.la
+
 libsampler_base_la_SOURCES = sampler_base.c sampler_base.h
 libsampler_base_la_LIBADD = $(CORE_LIBADD)
 lib_LTLIBRARIES += libsampler_base.la
@@ -20,8 +29,20 @@ lib_LTLIBRARIES += libsampler_base.la
 ldmssamplerincludedir = $(includedir)/ldms/sampler
 ldmssamplerinclude_HEADERS = sampler_base.h
 
+SUBDIRS += lustre_client
+SUBDIRS += lustre_mdt
+SUBDIRS += lustre_ost
+
+if HAVE_DCGM
+SUBDIRS += dcgm
+endif
+
 if ENABLE_IBNET
 SUBDIRS += ibnet
+endif
+
+if ENABLE_RDC
+SUBDIRS += rdc_sampler
 endif
 
 if ENABLE_JOBID
@@ -126,6 +147,10 @@ liblnet_stats_la_LIBADD = $(COMMON_LIBADD)
 pkglib_LTLIBRARIES += liblnet_stats.la
 endif
 
+if ENABLE_TX2MON
+SUBDIRS += tx2mon
+endif
+
 if ENABLE_MEMINFO
 SUBDIRS += meminfo
 endif
@@ -217,6 +242,10 @@ if ENABLE_FILESINGLE
 SUBDIRS += filesingle
 endif
 
+if ENABLE_PROCNET
+SUBDIRS += procnet
+endif
+
 if ENABLE_PROCSTAT
 SUBDIRS += procstat
 endif
@@ -225,10 +254,16 @@ if ENABLE_DSTAT
 SUBDIRS += dstat
 endif
 
-if ENABLE_SYSCLASSIB
+if HAVE_LIBIBMAD
+if HAVE_LIBIBUMAD
+if HAVE_IBA_IB_TYPES_H
+SUBDIRS += ibmad
+endif
+
 libsysclassib_la_SOURCES = sysclassib.c
-libsysclassib_la_LIBADD = $(COMMON_LIBADD) -libmad -libumad
+libsysclassib_la_LIBADD = $(COMMON_LIBADD) $(LTLIBIBMAD) $(LTLIBIBUMAD)
 pkglib_LTLIBRARIES += libsysclassib.la
+endif
 endif
 
 if ENABLE_OPA2

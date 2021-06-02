@@ -55,7 +55,7 @@ jbuf_t jbuf_append_va(jbuf_t jb, const char *fmt, va_list _ap)
 	space = jb->buf_len - jb->cursor;
 	cnt = vsnprintf(&jb->buf[jb->cursor], space, fmt, ap);
 	va_end(ap);
-	if (cnt > space) {
+	if (cnt >= space) {
 		space = jb->buf_len + cnt + JSON_BUF_START_LEN;
 		jb = realloc(jb, space);
 		if (jb) {
@@ -541,6 +541,8 @@ int json_attr_rem(json_entity_t d, char *name)
 static void json_list_free(json_list_t a)
 {
 	json_entity_t i;
+	if (!a)
+		return;
 	assert(a->base.type == JSON_LIST_VALUE);
 	while (!TAILQ_EMPTY(&a->item_list)) {
 		i = TAILQ_FIRST(&a->item_list);
@@ -552,6 +554,8 @@ static void json_list_free(json_list_t a)
 
 static void json_str_free(json_str_t s)
 {
+	if (!s)
+		return;
 	assert(s->base.type == JSON_STRING_VALUE);
 	free(s->str);
 	free(s);
@@ -559,6 +563,8 @@ static void json_str_free(json_str_t s)
 
 static void json_attr_free(json_attr_t a)
 {
+	if (!a)
+		return;
 	assert(a->base.type == JSON_ATTR_VALUE);
 	json_entity_free(a->name);
 	json_entity_free(a->value);
@@ -570,6 +576,8 @@ static void json_dict_free(json_dict_t d)
 	json_attr_t i;
 	hent_t ent;
 	htbl_t t;
+	if (!d)
+		return;
 
 	t = d->attr_table;
 	while (!htbl_empty(t)) {
@@ -768,7 +776,7 @@ json_entity_t __dict_new(json_entity_t d_, va_list ap)
 				goto err;
 			break;
 		default:
-			assert(0);
+			assert(0 || NULL == "unhandled type in ovis_json:__dict_new." );
 		}
 		json_attr_add(d, n, v);
 	next:

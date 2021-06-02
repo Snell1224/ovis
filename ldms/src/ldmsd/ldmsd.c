@@ -797,7 +797,15 @@ int ldmsd_set_register(ldms_set_t set, const char *pluing_name)
 			rc = ENOMEM;
 			goto free_inst_name;
 		}
-		rbn_init(&list->rbn, s->plugin_name);
+		char *pname = strdup(s->plugin_name);
+		if (!pname) {
+			free(list);
+			ldmsd_set_tree_unlock();
+			ldms_set_put(s->set);
+			rc = ENOMEM;
+			goto free_inst_name;
+		}
+		rbn_init(&list->rbn, pname);
 		LIST_INIT(&list->list);
 		rbt_ins(&set_tree, &list->rbn);
 	} else {
@@ -856,7 +864,9 @@ void ldmsd_set_deregister(const char *inst_name, const char *plugin_name)
 		free(set);
 	}
 	if (LIST_EMPTY(&list->list)) {
+		char *pname = list->rbn.key;
 		rbt_del(&set_tree, &list->rbn);
+		free(pname);
 		free(list);
 	}
 out:
@@ -1657,6 +1667,7 @@ int main(int argc, char *argv[])
 	}
 
 	opterr = 0;
+	char * dup_auth = NULL;
 
 	while ((op = getopt(argc, argv, FMT)) != -1) {
 		switch (op) {
@@ -1814,23 +1825,39 @@ int main(int argc, char *argv[])
 			break;
 		case 'A':
 			/* (multiple) auth options */
-			lval = strtok(optarg, "=");
+			dup_auth = strdup(optarg);
+			if (!dup_auth) {
+				printf("Not enough memory parsing options!\n");
+				exit(1);
+			}
+			lval = strtok(dup_auth, "=");
 			if (!lval) {
-				printf("ERROR: Expecting -A name=value\n");
+				printf("ERROR: Expecting -A name=value. Got %s\n",
+					optarg);
+				free(dup_auth);
 				exit(1);
 			}
 			rval = strtok(NULL, "");
 			if (!rval) {
-				printf("ERROR: Expecting -A name=value\n");
+				printf("ERROR: Expecting -A name=value. Got %s\n",
+					optarg);
+				free(dup_auth);
 				exit(1);
 			}
 			if (auth_opt->count == auth_opt->size) {
-				printf("ERROR: Too many auth options\n");
+				printf("ERROR: Too many (> %d) auth options %s\n",
+					auth_opt->size, optarg);
+				free(dup_auth);
 				exit(1);
 			}
-			auth_opt->list[auth_opt->count].name = lval;
-			auth_opt->list[auth_opt->count].value = rval;
+			auth_opt->list[auth_opt->count].name = strdup(lval);
+			auth_opt->list[auth_opt->count].value = strdup(rval);
+			if (!auth_opt->list[auth_opt->count].name || !auth_opt->list[auth_opt->count].value) {
+			    printf("Out of memory parsing auth options: %s\n", optarg);
+			    exit(1);
+			}
 			auth_opt->count++;
+			free(dup_auth);
 			break;
 		case 'n':
 			snprintf(myname, sizeof(myname), "%s", optarg);
@@ -1917,7 +1944,7 @@ int main(int argc, char *argv[])
 		if (!pfile) {
 			int piderr = errno;
 			ldmsd_log(LDMSD_LERROR, "Could not open the pid file named '%s': %s\n",
-				pidfile, strerror(piderr));
+				pidfile, STRERROR(piderr));
 			free(pidfile);
 			pidfile = NULL;
 		} else {
@@ -1942,7 +1969,7 @@ int main(int argc, char *argv[])
 			if (!bfile) {
 				int banerr = errno;
 				ldmsd_log(LDMSD_LERROR, "Could not open the banner file named '%s': %s\n",
-					bannerfile, strerror(banerr));
+					bannerfile, STRERROR(banerr));
 				free(bannerfile);
 				bannerfile = NULL;
 			} else {
@@ -2094,12 +2121,18 @@ int main(int argc, char *argv[])
 		case 'x':
 			if (check_arg("x", optarg, LO_NAME))
 				return EINVAL;
+			char *dup_xtuple = strdup(optarg);
+			if (!dup_xtuple) {
+				printf("out of memory parsing arguments\n");
+				return ENOMEM;
+			}
 			char *_xprt, *_port, *_host;
-			_xprt = optarg;
-			_port = strchr(optarg, ':');
+			_xprt = dup_xtuple;
+			_port = strchr(dup_xtuple, ':');
 			if (!_port) {
 				printf("Bad xprt format, expecting XPRT:PORT, "
 						"but got: %s\n", optarg);
+				free(dup_xtuple);
 				return EINVAL;
 			}
 			*_port = '\0';
@@ -2112,6 +2145,7 @@ int main(int argc, char *argv[])
 			}
 			/* Use the default auth domain */
 			ldmsd_listen_t listen = ldmsd_listen_new(_xprt, _port, _host, DEFAULT_AUTH);
+			free(dup_xtuple);
 			if (!listen) {
 				printf( "Error %d: failed to add listening "
 					"endpoint: %s:%s\n",

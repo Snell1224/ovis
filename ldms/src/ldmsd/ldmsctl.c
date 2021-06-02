@@ -425,6 +425,15 @@ static void help_loglevel()
 		"	level=	levels [DEBUG, INFO, ERROR, CRITICAL, QUIET]\n");
 }
 
+static void help_metric_sets_default_authz()
+{
+	printf( "\nSet the default authorization values for subsequently created metric sets\n\n"
+		"Parameters:\n"
+		"     [uid=]         User ID number or user name string\n"
+		"     [gid=]         Group ID number or group name string\n"
+		"     [perm=]        Octal number representing the permissions bits\n");
+}
+
 static void help_quit()
 {
 	printf( "\nquit\n"
@@ -512,12 +521,41 @@ static void resp_generic(ldmsd_req_hdr_t resp, size_t len, uint32_t rsp_err)
 	}
 }
 
+static int __thread_stats_print(json_entity_t stats)
+{
+	json_entity_t entries, e, u;
+	if (stats->type != JSON_DICT_VALUE) {
+		printf("Unrecognized thread stats format\n");
+		return EINVAL;
+	}
+
+	printf("%-16s %-12s %-12s\n", "Name", "Samples", "Utilization");
+	printf("---------------- ------------ ------------\n");
+	entries = json_value_find(stats, "entries");
+	if (entries->type != JSON_LIST_VALUE) {
+		printf("Unrecognized thread stats format\n");
+		return EINVAL;
+	}
+
+	for (e = json_item_first(entries); e; e = json_item_next(e)) {
+		printf("%16s %12ld ",
+				json_value_str(json_value_find(e, "name"))->str,
+				json_value_int(json_value_find(e, "sample_count")));
+		u = json_value_find(e, "utilization");
+		if (u->type == JSON_INT_VALUE)
+			printf("%12ld\n", json_value_int(u));
+		else
+			printf("%12g\n", json_value_float(u));
+	}
+	return 0;
+}
+
 static void resp_daemon_status(ldmsd_req_hdr_t resp, size_t len, uint32_t rsp_err)
 {
 	int rc;
 	ldmsd_req_attr_t attr;
 	json_parser_t parser;
-	json_entity_t json, thread;
+	json_entity_t json, state, stats;
 	if (rsp_err) {
 		resp_generic(resp, len, rsp_err);
 		return;
@@ -533,37 +571,24 @@ static void resp_daemon_status(ldmsd_req_hdr_t resp, size_t len, uint32_t rsp_er
 		return;
 	}
 	rc = json_parse_buffer(parser, (char*)attr->attr_value, len, &json);
+	json_parser_free(parser);
 	if (rc) {
 		printf("syntax error parsing JSON string\n");
-		json_parser_free(parser);
 		return;
 	}
-	json_parser_free(parser);
 
-	if (json->type != JSON_LIST_VALUE) {
-		printf("Unrecognized JSON daemon status format\n");
+	if (json->type != JSON_DICT_VALUE) {
+		printf("Unrecognized daemon_status format\n");
 		goto out;
 	}
 
-	printf("Thread           Task Count\n");
-	printf("---------------- ----------\n");
+	state = json_value_find(json, "state");
+	if (state)
+		printf("Daemon State: %s\n", json_value_str(state)->str);
 
-	json_entity_t thr_id, count;
-
-	for (thread = json_item_first(json); thread; thread = json_item_next(thread)) {
-		if (thread->type != JSON_DICT_VALUE) {
-			printf("Unrecognized JSON daemon status format\n");
-			goto out;
-		}
-		thr_id = json_value_find(thread, "thread");
-		count = json_value_find(thread, "task_count");
-		if (!thr_id || !count) {
-			printf("Unrecognized status format\n");
-			goto out;
-		}
-		printf("%15s %10s\n", json_value_str(thr_id)->str,
-					json_value_str(count)->str);
-	}
+	stats = json_value_find(json, "thread_stats");
+	if (stats)
+		(void) __thread_stats_print(stats);
 out:
 	json_entity_free(json);
 }
@@ -1839,7 +1864,7 @@ static void resp_thread_stats(ldmsd_req_hdr_t resp, size_t len, uint32_t rsp_err
 
 	int rc;
 	json_parser_t parser;
-	json_entity_t stats, entries, e, u;
+	json_entity_t stats;
 
 	ldmsd_req_attr_t attr = ldmsd_first_attr(resp);
 	if (!attr->discrim || (attr->attr_id != LDMSD_ATTR_JSON))
@@ -1857,31 +1882,8 @@ static void resp_thread_stats(ldmsd_req_hdr_t resp, size_t len, uint32_t rsp_err
 		return;
 	}
 
-	if (stats->type != JSON_DICT_VALUE) {
-		printf("Unrecognized thread stats format\n");
-		goto free_entity;
-	}
+	(void) __thread_stats_print(stats);
 
-	printf("%-16s %-12s %-12s\n", "Name", "Samples", "Utilization");
-	printf("---------------- ------------ ------------\n");
-	entries = json_value_find(stats, "entries");
-	if (entries->type != JSON_LIST_VALUE) {
-		printf("Unrecognized thread stats format\n");
-		goto free_entity;
-	}
-
-	for (e = json_item_first(entries); e; e = json_item_next(e)) {
-		printf("%16s %12ld ",
-				json_value_str(json_value_find(e, "name"))->str,
-				json_value_int(json_value_find(e, "sample_count")));
-		u = json_value_find(e, "utilization");
-		if (u->type == JSON_INT_VALUE)
-			printf("%12ld\n", json_value_int(u));
-		else
-			printf("%12g\n", json_value_float(u));
-	}
-
- free_entity:
  	json_entity_free(stats);
  	return;
 }
@@ -2076,6 +2078,8 @@ static struct command command_tbl[] = {
 	{ "listen", LDMSD_LISTEN_REQ, NULL, help_listen, resp_generic },
 	{ "load", LDMSD_PLUGN_LOAD_REQ, NULL, help_load, resp_generic },
 	{ "loglevel", LDMSD_VERBOSE_REQ, NULL, help_loglevel, resp_generic },
+	{ "metric_sets_default_authz", LDMSD_SET_DEFAULT_AUTHZ_REQ, NULL,
+			help_metric_sets_default_authz, resp_generic },
 	{ "oneshot", LDMSD_ONESHOT_REQ, NULL, help_oneshot, resp_generic },
 	{ "plugn_sets", LDMSD_PLUGN_SETS_REQ, NULL, help_plugn_sets, resp_plugn_sets },
 	{ "prdcr_add", LDMSD_PRDCR_ADD_REQ, NULL, help_prdcr_add, resp_generic },
@@ -2263,7 +2267,8 @@ static int __handle_cmd(struct ldmsctl_ctrl *ctrl, char *cmd_str)
 
 		rc = ctrl->send_req(ctrl, request, len);
 		if (rc) {
-			printf("Failed to send data to ldmsd. %s\n", strerror(errno));
+			printf("Failed to send data to ldmsd. %s\n",
+				STRERROR(errno));
 			return rc;
 		}
 	}
@@ -2271,19 +2276,17 @@ static int __handle_cmd(struct ldmsctl_ctrl *ctrl, char *cmd_str)
 	 * Send all the records and handle the response now.
 	 */
 	ldmsd_req_hdr_t resp, rsp = NULL;
-	size_t req_hdr_sz = sizeof(*resp);
 	size_t lbufsz = 1024;
-	char *lbuf = malloc(lbufsz);
-	if (!lbuf) {
+	struct ldmsd_msg_buf *b;
+
+	b = ldmsd_msg_buf_new(lbufsz);
+	if (!b) {
 		printf("Out of memory\n");
 		exit(1);
 	}
 
-	size_t reclen = 0;
-	size_t msglen = 0;
 	rc = 0;
 	ldmsctl_buffer_t recv_buf;
-	int flags = 0;
 
 	while (1) {
 		sem_wait(&ctrl->ldms_xprt.recv_sem);
@@ -2293,45 +2296,30 @@ static int __handle_cmd(struct ldmsctl_ctrl *ctrl, char *cmd_str)
 			TAILQ_REMOVE(&recv_buf_q, recv_buf, entry);
 			pthread_mutex_unlock(&recv_buf_q_lock);
 			resp = (ldmsd_req_hdr_t)recv_buf->buf;
-			flags = ntohl(resp->flags);
-			if (flags & LDMSD_REQ_SOM_F)
-				reclen = ntohl(resp->rec_len);
-			else
-				reclen = ntohl(resp->rec_len) - req_hdr_sz;
-			if (lbufsz < msglen + reclen) {
-				char *nlbuf = realloc(lbuf, msglen + (reclen * 2));
-				if (!nlbuf) {
-					printf("Out of memory\n");
-					exit(ENOMEM);
-				}
-				lbuf = nlbuf;
-				lbufsz = msglen + (reclen * 2);
-				memset(&lbuf[msglen], 0, lbufsz - msglen);
+			rc = ldmsd_msg_gather(b, resp);
+			if (0 == rc) {
+				rsp = (ldmsd_req_hdr_t)b->buf;
+				goto done_recv;
+			} else if (EBUSY != rc) {
+				printf("Failed to process messages from LDMSD. %s\n",
+						STRERROR(rc));
+				exit(rc);
 			}
-			if (flags & LDMSD_REQ_SOM_F)
-				memcpy(&lbuf[msglen], resp, reclen);
-			else
-				memcpy(&lbuf[msglen], resp + 1, reclen);
-			msglen += reclen;
 			ldmsctl_buffer_free(recv_buf);
 			pthread_mutex_lock(&recv_buf_q_lock);
 			recv_buf = TAILQ_FIRST(&recv_buf_q);
 		}
 		pthread_mutex_unlock(&recv_buf_q_lock);
-
-		if ((flags & LDMSD_REQ_EOM_F) != 0) {
-			rsp = (ldmsd_req_hdr_t)lbuf;
-			break;
-		}
 	}
+done_recv:
 	/* We have received the whole message */
 	if (rsp) {
 		ldmsd_ntoh_req_msg(rsp);
-		cmd->resp(rsp, msglen, rsp->rsp_err);
+		cmd->resp(rsp, b->len, rsp->rsp_err);
 	} else {
 		assert(rsp);
 	}
-	free(lbuf);
+	ldmsd_msg_buf_free(b);
 	return rc;
 }
 
@@ -2383,7 +2371,7 @@ struct ldmsctl_ctrl *__ldms_xprt_ctrl(const char *host, const char *port,
 	ctrl->ldms_xprt.x = ldms_xprt_new_with_auth(xprt, NULL, auth, auth_opt);
 	if (!ctrl->ldms_xprt.x) {
 		printf("Failed to create an ldms transport. %s\n",
-						strerror(errno));
+						STRERROR(errno));
 		return NULL;
 	}
 

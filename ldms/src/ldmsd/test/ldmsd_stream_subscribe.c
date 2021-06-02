@@ -10,18 +10,23 @@
 #include <getopt.h>
 #include <semaphore.h>
 #include <pthread.h>
+#include <netdb.h>
 #include <ovis_json/ovis_json.h>
 #include <assert.h>
+#include <coll/rbt.h>
 #include "ldms.h"
 #include "../ldmsd_request.h"
 #include "../ldmsd_stream.h"
 
 static ldms_t ldms;
 static sem_t recv_sem;
-FILE *file;
+static FILE *file;
+static int quiet;
 
 void msglog(const char *fmt, ...)
 {
+	if (quiet)
+		return;
 	va_list ap;
 	static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -40,12 +45,14 @@ static struct option long_opts[] = {
 	{"auth",     required_argument, 0,  'a' },
 	{"auth_arg", required_argument, 0,  'A' },
 	{"daemonize",no_argument,       0,  'D' },
+	{"host",     required_argument, 0,  'h' },
+	{"quiet",	no_argument,		0,	'q' },
 	{0,          0,                 0,  0 }
 };
 
 void usage(int argc, char **argv)
 {
-	printf("usage: %s -x <xprt> -p <port> "
+	printf("usage: %s -x <xprt> -p <port> -h <host>"
 	       "-s <stream-name> "
 	       "-f <file> -a <auth> -A <auth-opt> "
 	       "-D\n",
@@ -53,9 +60,69 @@ void usage(int argc, char **argv)
 	exit(1);
 }
 
-static const char *short_opts = "p:f:s:x:a:A:D";
+static const char *short_opts = "p:f:s:x:a:A:Dqh:";
 
 #define AUTH_OPT_MAX 128
+
+struct xprt_ctxt {
+	struct rbn rbn;
+	struct ldmsd_msg_buf *buf;
+};
+#define XPRT_CTXT_LEN_GRAIN 0xFFF
+#define XPRT_CTXT_LEN_ROUND(L) ((((L)-1)|XPRT_CTXT_LEN_GRAIN) + 1)
+#define XPRT_CTXT_INIT_LEN (1024*1024)
+
+int xprt_ctxt_cmp(void *tree_key, const void *key)
+{
+	/* simply compare pointers to ldms xprts */
+	return (int64_t)tree_key - (int64_t)key;
+}
+
+pthread_mutex_t xprt_ctxt_mutex = PTHREAD_MUTEX_INITIALIZER;
+struct rbt xprt_ctxt_rbt = RBT_INITIALIZER(xprt_ctxt_cmp);
+
+struct xprt_ctxt *xprt_ctxt_new(ldms_t ldms)
+{
+	struct xprt_ctxt *ctxt;
+	pthread_mutex_lock(&xprt_ctxt_mutex);
+	ctxt = (struct xprt_ctxt *)rbt_find(&xprt_ctxt_rbt, ldms);
+	if (ctxt) {
+		ctxt = NULL;
+		errno = EEXIST;
+		goto out;
+	}
+	ctxt = calloc(1, sizeof(*ctxt));
+	if (!ctxt)
+		goto out;
+	ctxt->buf = ldmsd_msg_buf_new(XPRT_CTXT_INIT_LEN);
+	if (!ctxt->buf) {
+		free(ctxt);
+		goto out;
+	}
+	rbn_init(&ctxt->rbn, ldms);
+	rbt_ins(&xprt_ctxt_rbt, &ctxt->rbn);
+ out:
+	pthread_mutex_unlock(&xprt_ctxt_mutex);
+	return ctxt;
+}
+
+struct xprt_ctxt *xprt_ctxt_find(ldms_t ldms)
+{
+	struct xprt_ctxt *ctxt;
+	pthread_mutex_lock(&xprt_ctxt_mutex);
+	ctxt = (struct xprt_ctxt *)rbt_find(&xprt_ctxt_rbt, ldms);
+	pthread_mutex_unlock(&xprt_ctxt_mutex);
+	return ctxt;
+}
+
+void xprt_ctxt_free(struct xprt_ctxt *ctxt)
+{
+	pthread_mutex_lock(&xprt_ctxt_mutex);
+	rbt_del(&xprt_ctxt_rbt, &ctxt->rbn);
+	pthread_mutex_unlock(&xprt_ctxt_mutex);
+	ldmsd_msg_buf_free(ctxt->buf);
+	free(ctxt);
+}
 
 static int stream_recv_cb(ldmsd_stream_client_t c, void *ctxt,
 			 ldmsd_stream_type_t stream_type,
@@ -88,6 +155,7 @@ static int stream_publish_handler(ldmsd_req_hdr_t req)
 		msglog("The stream name is missing, malformed stream request.\n");
 		exit(5);
 	}
+
 	stream_name = strdup((char *)attr->attr_value);
 	if (!stream_name) {
 		printf("ERROR: out of memory\n");
@@ -139,39 +207,94 @@ static int stream_publish_handler(ldmsd_req_hdr_t req)
 	return 0;
 }
 
+static int __send(void *xprt, char *data, size_t len)
+{
+	ldms_t x = (ldms_t)xprt;
+	return ldms_xprt_send(x, data, len);
+}
+
+static int send_ack(ldms_t x, ldmsd_req_hdr_t req)
+{
+	struct ldmsd_msg_buf *buf;
+	struct ldmsd_req_attr_s a;
+	char *ack_s = "ACK";
+	int rc;
+
+	buf = ldmsd_msg_buf_new(ldms_xprt_msg_max(x));
+	if (!buf) {
+		msglog("Out of memory\n");
+		return ENOMEM;
+	}
+
+	a.discrim = 1;
+	a.attr_id = LDMSD_ATTR_STRING;
+	a.attr_len = strlen(ack_s) + 1;
+	ldmsd_hton_req_attr(&a);
+	rc = ldmsd_msg_buf_send(buf, x, req->msg_no, __send, LDMSD_REQ_SOM_F,
+			LDMSD_REQ_TYPE_CONFIG_RESP, 0, (char *)&a, sizeof(a));
+	if (rc)
+		return rc;
+	rc = ldmsd_msg_buf_send(buf, x, req->msg_no, __send, 0,
+			LDMSD_REQ_TYPE_CONFIG_RESP, 0, ack_s, strlen(ack_s) + 1);
+	if (rc)
+		return rc;
+
+	/* Terminating */
+	a.discrim = 0;
+	rc = ldmsd_msg_buf_send(buf, x, req->msg_no, __send, LDMSD_REQ_EOM_F,
+				LDMSD_REQ_TYPE_CONFIG_RESP, 0,
+				(char *)&a.discrim, sizeof(a.discrim));
+	return rc;
+}
+
 int process_request(ldms_t x, ldmsd_req_hdr_t request)
 {
 	uint32_t req_id;
 
-	ldmsd_ntoh_req_msg(request);
-
-	if (request->marker != LDMSD_RECORD_MARKER) {
+	if (ntohl(request->marker) != LDMSD_RECORD_MARKER) {
 		msglog("Config request is missing record marker");
 		exit(3);
 	}
-	req_id = request->req_id;
+	req_id = ntohl(request->req_id);
 	if (req_id != LDMSD_STREAM_PUBLISH_REQ) {
 		msglog("Unexpected request id %d\n", req_id);
 		exit(4);
 	}
 
-	int rc = stream_publish_handler(request);
+	struct xprt_ctxt *ctxt = xprt_ctxt_find(x);
+	if (!ctxt) {
+		msglog("Cannot find ctxt\n");
+		exit(5);
+	}
 
-	request->flags = LDMSD_REQ_SOM_F | LDMSD_REQ_EOM_F;
-	request->rsp_err = rc;
-	request->rec_len = sizeof(*request);
-	ldmsd_hton_req_hdr(request);
-	return ldms_xprt_send(x, (char *)request, sizeof(*request));
+	int rc = ldmsd_msg_gather(ctxt->buf, request);
+	if (EBUSY == rc)
+		return 0;
+	if (rc) {
+		msglog("ERROR: Failed to receive messages: %d\n", rc);
+		return rc;
+	}
+
+	/* we got all request data */
+	ldmsd_req_hdr_t req = (ldmsd_req_hdr_t)ctxt->buf->buf;
+	ldmsd_ntoh_req_msg(req);
+
+	rc = send_ack(x, req);
+	if (rc) {
+		msglog("ERROR: Failed to send the acknowledgment: %d\n", rc);
+		/* Continue to process the stream */
+	}
+
+	rc = stream_publish_handler(req);
+
+	/* request processed, reset data buffer */
+	ldmsd_msg_buf_init(ctxt->buf);
+	return 0;
 }
 
 static void recv_msg(ldms_t x, char *data, size_t data_len)
 {
 	ldmsd_req_hdr_t request = (ldmsd_req_hdr_t)data;
-
-	if (ntohl(request->rec_len) > ldms_xprt_msg_max(x)) {
-		msglog("Test command does not support multi-record stream data");
-		exit(1);
-	}
 
 	switch (ntohl(request->type)) {
 	case LDMSD_REQ_TYPE_CONFIG_CMD:
@@ -186,12 +309,22 @@ static void recv_msg(ldms_t x, char *data, size_t data_len)
 
 static void event_cb(ldms_t x, ldms_xprt_event_t e, void *cb_arg)
 {
+	struct xprt_ctxt *ctxt;
 	switch (e->type) {
 	case LDMS_XPRT_EVENT_CONNECTED:
+		ctxt = xprt_ctxt_new(x);
+		if (!ctxt) {
+			msglog("xprt_ctxt_new() failed, errno: %d\n", errno);
+			ldms_xprt_close(ldms);
+		}
 		break;
 	case LDMS_XPRT_EVENT_DISCONNECTED:
 	case LDMS_XPRT_EVENT_REJECTED:
 	case LDMS_XPRT_EVENT_ERROR:
+		ctxt = xprt_ctxt_find(x);
+		if (ctxt) {
+			xprt_ctxt_free(ctxt);
+		}
 		ldms_xprt_put(x);
 		break;
 	case LDMS_XPRT_EVENT_RECV:
@@ -202,25 +335,29 @@ static void event_cb(ldms_t x, ldms_xprt_event_t e, void *cb_arg)
 	}
 }
 
-static int setup_connection(char *xprt, short port_no, char *auth)
+static int setup_connection(char *xprt, char *host, char *port, char *auth)
 {
-	struct sockaddr_in sin;
 	int rc;
+	struct addrinfo *ai, hint = { .ai_flags = AI_PASSIVE, .ai_family = AF_INET };
+
+	rc = getaddrinfo(host, port, &hint, &ai);
+	if (rc)
+		return errno;
 
 	ldms = ldms_xprt_new_with_auth(xprt, msglog, auth, NULL);
 	if (!ldms) {
 		msglog("Error %d creating the '%s' transport\n", errno, xprt);
-		return errno;
+		rc = errno;
+		goto out;
 	}
 
 	sem_init(&recv_sem, 1, 0);
 
-	sin.sin_family = AF_INET;
-	sin.sin_addr.s_addr = 0;
-	sin.sin_port = htons(port_no);
-	rc = ldms_xprt_listen(ldms, (struct sockaddr *)&sin, sizeof(sin), event_cb, NULL);
+	rc = ldms_xprt_listen(ldms, ai->ai_addr, ai->ai_addrlen, event_cb, NULL);
 	if (rc)
 		msglog("Error %d listening on the '%s' transport.\n", rc, xprt);
+ out:
+	freeaddrinfo(ai);
 	return rc;
 }
 
@@ -229,12 +366,13 @@ int main(int argc, char **argv)
 	char *xprt = "sock";
 	char *filename = NULL;
 	char *stream = NULL;
+	char *host = NULL;
+	char *port = NULL;
 	int opt, opt_idx;
 	char *lval, *rval;
 	char *auth = "none";
 	struct attr_value_list *auth_opt = NULL;
 	const int auth_opt_max = AUTH_OPT_MAX;
-	short port_no = 0;
 	int daemonize = 0;
 
 	auth_opt = av_new(auth_opt_max);
@@ -245,8 +383,11 @@ int main(int argc, char **argv)
 
 	while ((opt = getopt_long(argc, argv, short_opts, long_opts, &opt_idx)) > 0) {
 		switch (opt) {
+		case 'q':
+			quiet = 1;
+			break;
 		case 'p':
-			port_no = atoi(optarg);
+			port = optarg;
 			break;
 		case 'x':
 			xprt = strdup(optarg);
@@ -294,11 +435,14 @@ int main(int argc, char **argv)
 		case 'D':
 			daemonize = 1;
 			break;
+		case 'h':
+			host = optarg;
+			break;
 		default:
 			usage(argc, argv);
 		}
 	}
-	if (!port_no || !stream)
+	if (!port || !stream)
 		usage(argc, argv);
 
 	if (daemonize) {
@@ -318,7 +462,7 @@ int main(int argc, char **argv)
 		file = stdout;
 	}
 
-	int rc = setup_connection(xprt, port_no, auth);
+	int rc = setup_connection(xprt, host, port, auth);
 	if (rc) {
 		errno = rc;
 		perror("Could not listen");

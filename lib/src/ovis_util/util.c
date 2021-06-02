@@ -221,6 +221,9 @@ err:
 	return NULL;
 }
 
+/*
+ * This function returns a value that must be freed
+ */
 char *str_repl_env_vars(const char *str)
 {
 	if (!str)
@@ -659,7 +662,7 @@ __attribute__ ((sentinel)) int ovis_join_buf(char *buf, size_t buflen, char *pat
 	if (!buf)
 		return EINVAL;
 	buf[0] = '\0';
-	
+
 
 	va_start(ap, pathsep);
 	n = va_arg(ap, const char *);
@@ -670,7 +673,7 @@ __attribute__ ((sentinel)) int ovis_join_buf(char *buf, size_t buflen, char *pat
 
 	chunk = strlen(n);
 	if ( (len + chunk) < buflen) {
-		strncat(buf + len, n, chunk);
+		memcpy(buf + len, n, chunk);
 		len += chunk;
 	} else {
 		rc = E2BIG;
@@ -678,7 +681,7 @@ __attribute__ ((sentinel)) int ovis_join_buf(char *buf, size_t buflen, char *pat
 
 	while ( 0 == rc && (n = va_arg(ap, const char *)) != NULL) {
 		if ((len + sepsize) < buflen) {
-			strncat(buf + len, sep, sepsize);
+			memcpy(buf + len, sep, sepsize);
 			len += sepsize;
 		} else {
 			rc = E2BIG;
@@ -686,7 +689,7 @@ __attribute__ ((sentinel)) int ovis_join_buf(char *buf, size_t buflen, char *pat
 		}
 		chunk = strlen(n);
 		if ((len + chunk) < buflen) {
-			strncat(buf + len, n, chunk);
+			memcpy(buf + len, n, chunk);
 			len += chunk;
 		} else {
 			rc = E2BIG;
@@ -840,8 +843,8 @@ int ovis_access_check(uid_t auid, gid_t agid, int acc,
 	if (070 & macc) {
 		if (agid == ogid)
 			return 0;
-		/* else need to check x->ruid group list */
-		if (0 == __uid_gid_check(auid, ouid))
+		/* else need to check auid group list */
+		if (0 == __uid_gid_check(auid, ogid))
 			return 0;
 	}
 	return EACCES;
@@ -990,21 +993,8 @@ const char* ovis_errno_abbvr(int e)
 	return "UNKNOWN_ERRNO";
 }
 
-/**
- * \brief thread-safe strerror.
- *
- * \retval str The sys_errlist value.
- * \retval "unknown_errno" if the errno \c e is unknown.
- */
 const char *ovis_strerror(int e) {
-	if (e >=0 && e < sys_nerr)
-		return sys_errlist[e];
-	return "unknown_errno";
-/* the gnu linker nuisance warning about sys_errlist.
- * If we truly hate it, we can use the code from nginx ngx_strerror
- * here. See: http://nginx.org/en/docs/sys_errlist.html
- * for why this is a good idea.
- */
+	return strerror(e);
 }
 
 /*

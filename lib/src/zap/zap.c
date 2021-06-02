@@ -265,7 +265,7 @@ zap_t zap_get(const char *name, zap_log_fn_t log_fn, zap_mem_info_fn_t mem_info_
 	char *lib = _libpath;
 	zap_t z = NULL;
 	char *errstr;
-	int ret;
+	int ret, len;
 	void *d = NULL;
 	char *saveptr = NULL;
 
@@ -274,12 +274,20 @@ zap_t zap_get(const char *name, zap_log_fn_t log_fn, zap_mem_info_fn_t mem_info_
 	if (!mem_info_fn)
 		mem_info_fn = default_zap_mem_info;
 
+	if (strlen(name) >= ZAP_MAX_TRANSPORT_NAME_LEN) {
+		errno = ENAMETOOLONG;
+		goto err;
+	}
+
 	libdir = getenv("ZAP_LIBPATH");
 	if (!libdir || libdir[0] == '\0')
-		strncpy(_libdir, ZAP_LIBPATH_DEFAULT, sizeof(_libdir));
-	else
-		strncpy(_libdir, libdir, sizeof(_libdir));
-
+		libdir = ZAP_LIBPATH_DEFAULT;
+	len = strlen(libdir);
+	if (len >= MAX_ZAP_LIBPATH) {
+		errno = ENAMETOOLONG;
+		goto err;
+	}
+	memcpy(_libdir, libdir, len + 1);
 	libdir = _libdir;
 
 	while ((libpath = strtok_r(libdir, ":", &saveptr)) != NULL) {
@@ -312,7 +320,7 @@ zap_t zap_get(const char *name, zap_log_fn_t log_fn, zap_mem_info_fn_t mem_info_
 	if (ret)
 		goto err1;
 
-	strncpy(z->name, name, sizeof(z->name));
+	memcpy(z->name, name, strlen(name)+1);
 	z->log_fn = log_fn;
 	z->mem_info_fn = mem_info_fn;
 	z->event_interpose = zap_interpose_event;
@@ -369,8 +377,7 @@ struct zap_interpose_ctxt {
 };
 
 /*
- * interposing a real callback, putting callback task into the queue.
- * Only read/write/recv completions are posted to the queue.
+ * Queue a zap event to one of the I/O threads
  */
 static
 void zap_interpose_cb(zap_ep_t ep, zap_event_t ev)
@@ -579,6 +586,8 @@ zap_ep_state_t zap_ep_state(zap_ep_t ep)
 
 void zap_put_ep(zap_ep_t ep)
 {
+	if (!ep)
+		return;
 	assert(ep->ref_count);
 	if (0 == __sync_sub_and_fetch(&ep->ref_count, 1)) {
 		zap_event_queue_ep_put(ep->event_queue);
@@ -705,22 +714,24 @@ loop:
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 	ent->ep->z->event_interpose(ent->ep, ent->ctxt);
 	pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
-	free(ent);
+	pthread_mutex_lock(&q->mutex);
+	TAILQ_INSERT_HEAD(&q->free_q, ent, entry);
+	pthread_mutex_unlock(&q->mutex);
+
 	goto loop;
 	return NULL;
 }
 
 int zap_event_add(struct zap_event_queue *q, zap_ep_t ep, void *ctxt)
 {
-	struct zap_event_entry *ent = malloc(sizeof(*ent));
-	if (!ent)
-		return errno;
+	struct zap_event_entry *ent;
+	pthread_mutex_lock(&q->mutex);
+	while (NULL == (ent = TAILQ_FIRST(&q->free_q))) {
+		pthread_cond_wait(&q->cond_vacant, &q->mutex);
+	};
+	TAILQ_REMOVE(&q->free_q, ent, entry);
 	ent->ep = ep;
 	ent->ctxt = ctxt;
-	pthread_mutex_lock(&q->mutex);
-	while (q->depth == 0) {
-		pthread_cond_wait(&q->cond_vacant, &q->mutex);
-	}
 	q->depth--;
 	if (ep->prio)
 		TAILQ_INSERT_TAIL(&q->prio_q, ent, entry);
@@ -742,6 +753,13 @@ void zap_event_queue_init(struct zap_event_queue *q, int qdepth,
 	pthread_mutex_init(&q->mutex, NULL);
 	pthread_cond_init(&q->cond_nonempty, NULL);
 	pthread_cond_init(&q->cond_vacant, NULL);
+	TAILQ_INIT(&q->free_q);
+	int i;
+	for (i = 0; i < qdepth; i++) {
+		struct zap_event_entry *ent = malloc(sizeof(*ent));
+		assert(ent);
+		TAILQ_INSERT_HEAD(&q->free_q, ent, entry);
+	}
 	TAILQ_INIT(&q->queue);
 	TAILQ_INIT(&q->prio_q);
 }
@@ -807,7 +825,7 @@ void zap_thrstat_reset(zap_thrstat_t stats)
 {
 	struct timespec now;
 	clock_gettime(CLOCK_REALTIME, &now);
-	stats->wait_start = stats->wait_end = now;
+	stats->start = stats->wait_start = stats->wait_end = now;
 	stats->proc_count = stats->wait_count = 0;
 	memset(stats->wait_window, 0, sizeof(uint64_t) * stats->window_size);
 	memset(stats->proc_window, 0, sizeof(uint64_t) * stats->window_size);
@@ -826,7 +844,7 @@ void zap_thrstat_reset_all()
 	pthread_mutex_lock(&thrstat_list_lock);
 	i = 0;
 	LIST_FOREACH(t, &thrstat_list, entry) {
-		t->wait_start = t->wait_end = now;
+		t->start = t->wait_start = t->wait_end = now;
 		t->proc_count = t->wait_count = 0;
 		memset(t->wait_window, 0, sizeof(uint64_t) * t->window_size);
 		memset(t->proc_window, 0, sizeof(uint64_t) * t->window_size);
@@ -867,6 +885,8 @@ err_1:
 
 void zap_thrstat_free(zap_thrstat_t stats)
 {
+	if (!stats)
+		return;
 	pthread_mutex_lock(&thrstat_list_lock);
 	LIST_REMOVE(stats, entry);
 	thrstat_count --;
@@ -949,6 +969,14 @@ uint64_t zap_thrstat_get_sample_count(zap_thrstat_t stats)
 	return (stats->proc_count + stats->wait_count) / 2;
 }
 
+double zap_thrstat_get_sample_rate(zap_thrstat_t stats)
+{
+	struct timespec now;
+	(void)clock_gettime(CLOCK_REALTIME, &now);
+	return (double)zap_thrstat_get_sample_count(stats)
+		/ ((double)(zap_timespec_diff_us(&stats->start, &now)) / 1000000.0);
+}
+
 double zap_thrstat_get_utilization(zap_thrstat_t in)
 {
 	struct timespec now;
@@ -976,6 +1004,7 @@ struct zap_thrstat_result *zap_thrstat_get_result()
 	LIST_FOREACH(t, &thrstat_list, entry) {
 		res->entries[i].name = strdup(zap_thrstat_get_name(t));
 		res->entries[i].sample_count = zap_thrstat_get_sample_count(t);
+		res->entries[i].sample_rate = zap_thrstat_get_sample_rate(t);
 		res->entries[i].utilization = zap_thrstat_get_utilization(t);
 		i += 1;
 	}
@@ -986,6 +1015,8 @@ out:
 
 void zap_thrstat_free_result(struct zap_thrstat_result *res)
 {
+	if (!res)
+		return;
 	int i;
 	for (i = 0; i < res->count; i++) {
 		if (res->entries[i].name)

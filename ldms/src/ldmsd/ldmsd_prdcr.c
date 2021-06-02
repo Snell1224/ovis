@@ -621,9 +621,11 @@ reset_prdcr:
 		assert(0 == "STOPPED shouldn't have xprt event");
 		break;
 	}
-	if (prdcr->xprt)
+	if (prdcr->xprt) {
+		ldmsd_xprt_term(prdcr->xprt);
 		ldms_xprt_put(prdcr->xprt);
-	prdcr->xprt = NULL;
+		prdcr->xprt = NULL;
+	}
 	ldmsd_prdcr_unlock(prdcr);
 }
 
@@ -764,8 +766,10 @@ ldmsd_prdcr_new_with_auth(const char *name, const char *xprt_name,
 	if (!auth)
 		auth = DEFAULT_AUTH;
 	auth_dom = ldmsd_auth_find(auth);
-	if (!auth_dom)
+	if (!auth_dom) {
+		errno = ENOENT;
 		goto out;
+	}
 	prdcr->conn_auth = strdup(auth_dom->plugin);
 	if (!prdcr->conn_auth)
 		goto out;

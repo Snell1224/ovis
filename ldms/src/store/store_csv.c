@@ -235,7 +235,6 @@ static void roll_cb(void *obj, void *cb_arg)
 	}
 	ch_output(nfp, tmp_path, CSHC(s_handle), cps);
 
-	notify_output(NOTE_OPEN, tmp_path, NOTE_DAT, CSHC(s_handle), cps);
 	strcpy(roc.filename, tmp_path);
 
 	if (s_handle->altheader){
@@ -253,8 +252,6 @@ static void roll_cb(void *obj, void *cb_arg)
 		} else {
 			ch_output(nhfp, tmp_headerpath, CSHC(s_handle), cps);
 		}
-		notify_output(NOTE_OPEN, tmp_headerpath,
-			NOTE_HDR, CSHC(s_handle), cps);
 		strcpy(roc.headerfilename, tmp_headerpath);
 	} else {
 		nhfp = fopen_perm(tmp_path, "a+", LDMSD_DEFAULT_FILE_PERM);
@@ -265,8 +262,6 @@ static void roll_cb(void *obj, void *cb_arg)
 		} else {
 			ch_output(nhfp, tmp_path, CSHC(s_handle), cps);
 		}
-		notify_output(NOTE_OPEN, tmp_path, NOTE_HDR,
-			CSHC(s_handle), cps);
 		strcpy(roc.headerfilename, tmp_path);
 	}
 	if (!nhfp) {
@@ -276,22 +271,18 @@ static void roll_cb(void *obj, void *cb_arg)
 	//close and swap
 	if (s_handle->file) {
 		fclose(s_handle->file);
-		notify_output(NOTE_CLOSE, s_handle-> filename, NOTE_DAT,
-			CSHC(s_handle), cps);
-		rename_output(s_handle->filename, NOTE_DAT,
+		rename_output(s_handle->filename, FTYPE_DATA,
 			CSHC(s_handle), cps);
 	}
 	if (s_handle->headerfile) {
 		fclose(s_handle->headerfile);
 	}
-	if (s_handle->headerfilename) {
-		notify_output(NOTE_CLOSE, s_handle-> headerfilename, NOTE_HDR,
-			CSHC(s_handle), cps);
-		rename_output(s_handle->headerfilename, NOTE_HDR,
-			CSHC(s_handle), cps);
+	if (s_handle->altheader != 0 && s_handle->headerfilename) {
+		rename_output(s_handle->headerfilename, FTYPE_HDR,
+			      CSHC(s_handle), cps);
 	}
-	if (s_handle->typefilename) {
-		rename_output(s_handle->typefilename, NOTE_KIND,
+	if (s_handle->typeheader != 0 && s_handle->typefilename) {
+		rename_output(s_handle->typefilename, FTYPE_KIND,
 			CSHC(s_handle), cps);
 		snprintf(tmp_typepath, PATH_MAX, "%s.KIND.%d",
 			s_handle->path, (int)appx);
@@ -725,7 +716,7 @@ static const char *usage(struct ldmsd_plugin *self)
 		"         - typeheader Type header line in extra .KIND file (optional, default 0)\n"
 		"                0- no header, 1- types 1:1 with csv columns,\n"
 	       	"                2- types in array notation\n"
-		NOTIFY_USAGE
+		FILE_PROPS_USAGE
 		"         - userdata     UserData in printout (optional, default 0)\n"
 		"         - metapath A string template for the file rename, where %[BCDPSTs]\n"
 		"           are replaced per the man page Plugin_store_csv.\n"
@@ -748,7 +739,8 @@ static void *get_ucontext(ldmsd_store_handle_t _s_handle)
 
 /*
  * note: this should be residual from v2 where we may not have had the header info until a store was called
- * which then meant we had the mvec. ideally the print_header will always happen from the store_open.
+ * which then meant we had the mvec. ideally the print_header will always happen from the open_store,
+ * but in point of fact is currently _never_ called in open_store.
  * Currently we still have to keep this to invert the metric order
  */
 static int print_header_from_store(struct csv_store_handle *s_handle, ldms_set_t set,
@@ -777,13 +769,13 @@ static int print_header_from_store(struct csv_store_handle *s_handle, ldms_set_t
 		else
 			ec = snprintf(tmp_path, PATH_MAX, "%s.HEADER",
 				s_handle->path);
-			} else {
+	} else {
 		if (rolltype >= MINROLLTYPE)
 			ec = snprintf(tmp_path, PATH_MAX, "%s.%d",
 				s_handle->path, (int)s_handle->otime);
 		else
 			ec = snprintf(tmp_path, PATH_MAX, "%s", s_handle->path);
-				}
+	}
 	(void)ec;
 	csv_format_header_common(fp, tmp_path, CCSHC(s_handle), s_handle->udata,
 		&PG, set, metric_array, metric_count);
@@ -798,22 +790,19 @@ static int print_header_from_store(struct csv_store_handle *s_handle, ldms_set_t
 
 	/* dump data types header, or whine and continue to other headers. */
 	if (s_handle->typeheader > 0 && s_handle->typeheader <= TH_MAX) {
-		fp = fopen(s_handle->typefilename, "w");
+		fp = fopen_perm(s_handle->typefilename, "w", LDMSD_DEFAULT_FILE_PERM);
 		if (!fp) {
 			int rc = errno;
 			PG.msglog(LDMSD_LERROR, PNAME ": print_header: %s "
 				"failed to open types file (%d).\n",
 				s_handle->typefilename, rc);
 		} else {
-			ch_output(fp, tmp_path, CSHC(s_handle), &PG);
+			ch_output(fp, s_handle->typefilename, CSHC(s_handle), &PG);
 			csv_format_types_common(s_handle->typeheader, fp, 
 				s_handle->typefilename, CCSHC(s_handle),
 				s_handle->udata, &PG, set,
 				metric_array, metric_count);
 			fclose(fp);
-			struct csv_store_handle_common *sh = CSHC(s_handle);
-			notify_output(NOTE_OPEN, tmp_path, NOTE_KIND, sh, &PG);
-			notify_output(NOTE_CLOSE, tmp_path, NOTE_KIND, sh, &PG);
 		}
 	}
 
@@ -1018,9 +1007,6 @@ open_store(struct ldmsd_store *s, const char *container, const char* schema,
 		idx_add(store_idx, (void *)skey, strlen(skey), s_handle);
 	}
 
-	notify_output(NOTE_OPEN, s_handle->filename, NOTE_DAT, CSHC(s_handle), &PG);
-	notify_output(NOTE_OPEN, s_handle->headerfilename, NOTE_HDR,
-		CSHC(s_handle), &PG);
 	pthread_mutex_unlock(&s_handle->lock);
 	goto out;
 

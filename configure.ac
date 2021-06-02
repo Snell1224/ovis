@@ -130,6 +130,28 @@ OPTION_DEFAULT_DISABLE([ugni], [ENABLE_UGNI])
 dnl dnl OPTION_DEFAULT_DISABLE([sos], [ENABLE_SOS])
 dnl dnl OPTION_WITH_OR_BUILD([sos],[../sos],[sos/src sos/include ods/src ods/include])
 
+# PKG_PROG_PKG_CONFIG before all PKG_CHECK_MODULES may or not be called, per pkg.m4.
+m4_ifndef([PKG_CHECK_MODULES],
+      [m4_fatal([pkg.m4 not found. Please install pkg-config (Ubuntu) or pkgconfig (RHEL) package])])
+PKG_PROG_PKG_CONFIG
+
+dnl RDC defaults to no instead of search because amd currently recommends
+dnl multiple non-default path installations (/opt).
+AC_ARG_ENABLE([rdc],
+	[AS_HELP_STRING([--enable-rdc], [attempt components that depend upon AMD rdc tooling @<:@default=no@:>@ for GPUs. Set RDC_CFLAGS=-I$rdcinclude and RDC_LIBS=-L$rdclibdir])],
+	[],
+	[enable_rdc="no"])
+if test "$enable_rdc" != "no"; then
+    PKG_CHECK_MODULES([RDC], [rdc],
+		      [AC_DEFINE([HAVE_RDC],[1],[if AMD rdc module present.])],
+		      AC_MSG_ERROR([pkg-config rdc failed])
+		      )
+    AC_MSG_RESULT([rdc include: $RDC_CFLAGS])
+    AC_MSG_RESULT([rdc lib: $RDC_LIBS])
+    HAVE_RDC=yes
+fi
+AM_CONDITIONAL([ENABLE_RDC], [test "x$HAVE_RDC" = xyes])
+
 have_zap=0
 
 if test "$disable_zap" != "yes"; then
@@ -152,8 +174,6 @@ dnl we need libibverbs-devel and librdmacm-devel to support rdma
     [AC_MSG_ERROR([Missing header. librdmacm-devel not installed?])])
   fi
   if test "$enable_ugni" = "yes"; then
-    m4_ifndef([PKG_CHECK_MODULES],
-              [m4_fatal([pkg.m4 not found. Please install pkg-config (Ubuntu) or pkgconfig (RHEL) package])])
     PKG_CHECK_MODULES([UGNI], [cray-ugni],
 		      [AC_DEFINE([HAVE_CRAY_UGNI],[1],[if cray-ugni module present.])],
 		      AC_MSG_ERROR([pkg-config cray-ugni failed])
@@ -275,6 +295,7 @@ if test -z "$ENABLE_MPI_SAMPLER_TRUE" ; then
 	AX_MPI([:],[ AC_MSG_ERROR([MPICC required by mpi_sampler ])])
 fi
 OPTION_DEFAULT_ENABLE([procinterrupts], [ENABLE_PROCINTERRUPTS])
+OPTION_DEFAULT_ENABLE([procnet], [ENABLE_PROCNET])
 OPTION_DEFAULT_ENABLE([procnetdev], [ENABLE_PROCNETDEV])
 OPTION_DEFAULT_ENABLE([procnfs], [ENABLE_PROCNFS])
 OPTION_DEFAULT_ENABLE([dstat], [ENABLE_DSTAT])
@@ -287,7 +308,6 @@ OPTION_DEFAULT_ENABLE([tsampler], [ENABLE_TSAMPLER])
 OPTION_DEFAULT_ENABLE([cray_power_sampler], [ENABLE_CRAY_POWER_SAMPLER])
 dnl cray_power_sampler won't build with --disable-tsampler
 
-OPTION_DEFAULT_DISABLE([sysclassib], [ENABLE_SYSCLASSIB])
 OPTION_DEFAULT_DISABLE([opa2], [ENABLE_OPA2])
 OPTION_DEFAULT_DISABLE([ibnet], [ENABLE_IBNET])
 OPTION_DEFAULT_ENABLE([loadavg], [ENABLE_LOADAVG])
@@ -352,6 +372,47 @@ AS_IF([test "x$enable_papi" != xno],[
 AM_CONDITIONAL([HAVE_LIBPAPI], [test "x$HAVE_LIBPAPI" = xyes])
 AM_CONDITIONAL([HAVE_LIBPFM], [test "x$HAVE_LIBPFM" = xyes])
 
+AC_ARG_ENABLE([infiniband],
+	[AS_HELP_STRING([--enable-infiniband], [require components that depend upon libibmad and libibumad @<:@default=check@:>@])],
+	[],
+	[enable_infiniband="check"])
+AS_IF([test "x$enable_infiniband" != xno],[
+	AC_LIB_HAVE_LINKFLAGS([ibmad], [], [#include <infiniband/mad.h>])
+	AS_IF([test "x$enable_infiniband" != xcheck],[
+		AS_IF([test "x$HAVE_LIBIBMAD" = xno],
+			[AC_MSG_ERROR([libibmad or <infiniband/mad.h> not found])])
+	])
+	AC_LIB_HAVE_LINKFLAGS([ibumad], [], [#include <infiniband/umad.h>])
+	AS_IF([test "x$enable_infiniband" != xcheck],[
+		AS_IF([test "x$HAVE_LIBIBUMAD" = xno],
+			[AC_MSG_ERROR([libibumad or <infiniband/umad.h> not found])])
+	])
+        CPPFLAGS_BACKUP=$CPPFLAGS
+        CPPFLAGS="$CPPFLAGS -I/usr/include/infiniband"
+        AC_CHECK_HEADERS([iba/ib_types.h], [], [
+		AS_IF([test "x$enable_infiniband" != xcheck],
+			[AC_MSG_ERROR([Header <infiniband/iba/ib_types.h> not found ])])
+        ])
+        CPPFLAGS=$CPPFLAGS_BACKUP
+])
+AM_CONDITIONAL([HAVE_LIBIBMAD], [test "x$HAVE_LIBIBMAD" = xyes])
+AM_CONDITIONAL([HAVE_LIBIBUMAD], [test "x$HAVE_LIBIBUMAD" = xyes])
+AM_CONDITIONAL([HAVE_IBA_IB_TYPES_H], [test "x$ac_cv_header_iba_ib_types_h" = xyes])
+
+# enable tx2mon by default only when sensible.
+AC_ARG_ENABLE([tx2mon],
+	[AS_HELP_STRING([--enable-tx2mon], [require components that depend upon tx2mon header) @<:@default=check@:>@])],
+	[],
+	[enable_tx2mon="check"])
+AS_IF([test "x$enable_tx2mon" != xno],[
+	AC_CHECK_HEADER([tx2mon/mc_oper_region.h], [HAVE_TX2MON=yes; enable_tx2mon=yes], [HAVE_TX2MON=no], [#include <stdint.h>])
+	AS_IF([test "x$enable_tx2mon" != xcheck],[
+		AS_IF([test "x$HAVE_TX2MON" = xno], [AC_MSG_ERROR([tx2mon headers not found. Install tx2mon package and (at runtime) kernel module on ThunderX2 platforms.])])
+	])
+])
+AM_CONDITIONAL([HAVE_TX2MON], [test "x$HAVE_TX2MON" = xyes])
+AM_CONDITIONAL([ENABLE_TX2MON], [test "$enable_tx2mon" = "yes"])
+
 if test -z "$ENABLE_KOKKOS_TRUE"; then
 	dnl kokkos needs sos (not the storesos).
 	CHECK_SOS=1
@@ -415,29 +476,6 @@ if test -z "$ENABLE_MUNGE_TRUE"; then
 	LIBS=""
 
 	AC_CHECK_HEADER(munge.h, [], AC_MSG_ERROR([munge.h not found]))
-fi
-
-dnl Checks for libraries
-if test -z "$ENABLE_SYSCLASSIB_TRUE"; then
-	AC_CHECK_LIB(ibmad, mad_rpc_open_port, [],
-		AC_MSG_ERROR([mad_rpc_open_port() function not found. sysclassib sampler
-		  requires libibmad 1.3.]))
-	dnl Reset LIBS variable.
-	LIBS=""
-
-	AC_CHECK_HEADER(infiniband/mad.h, [],
-		AC_MSG_ERROR([<infiniband/mad.h> not found.  Is libibmad-dev or
-			libibmad-devel installed?]))
-
-	AC_CHECK_LIB(ibumad, umad_get_port, [],
-		AC_MSG_ERROR([umad_get_port() function not found. sysclassib sampler
-			requires libibumad.]))
-	dnl Reset LIBS variable.
-	LIBS=""
-
-	AC_CHECK_HEADER(infiniband/umad.h, [],
-		AC_MSG_ERROR([<infiniband/umad.h> not found.  Is libibumad-dev or
-			libibumad-devel installed?]))
 fi
 
 AC_ARG_WITH([slurm],
@@ -675,6 +713,23 @@ fi
 OPTION_GITINFO
 OPTION_HOSTINFO
 
+AC_ARG_WITH([dcgm],
+  [AS_HELP_STRING([--with-dcgm],
+    [Include code that depends on Nvidia DCGM @<:@default=check@:>@])],
+  [],
+  [with_dcgm=check])
+LIBDCGM=
+AS_IF([test "x$with_dcgm" != xno],
+      [AC_CHECK_LIB([dcgm], [dcgmInit],
+         [have_dcgm=true],
+         [have_dcgm=false
+          if test "x$with_dcgm" != xcheck; then
+            AC_MSG_FAILURE([--with-dcgm was given, but test for dcgm failed])
+          fi
+         ])],
+      [have_dcgm=false])
+AM_CONDITIONAL([HAVE_DCGM], [test x$have_dcgm = xtrue])
+
 # define substitutions for configvars and other sed-generated files.
 # note carefully the escapes.
 OVIS_DO_SUBST([LDMS_SUBST_RULE], ["sed \
@@ -771,6 +826,7 @@ ldms/src/store/store_app/Makefile
 ldms/src/contrib/store/Makefile
 ldms/src/contrib/store/tutorial/Makefile
 ldms/src/contrib/store/timescale/Makefile
+ldms/src/sampler/dcgm/Makefile
 ldms/src/sampler/dstat/Makefile
 ldms/src/sampler/hello_stream/Makefile
 ldms/src/sampler/hello_stream/stream_configs/Makefile
@@ -779,18 +835,25 @@ ldms/src/sampler/lustre/Makefile
 ldms/src/sampler/job_info/Makefile
 ldms/src/sampler/job_info_slurm/Makefile
 ldms/src/sampler/llnl/Makefile
+ldms/src/sampler/lustre_client/Makefile
+ldms/src/sampler/lustre_mdt/Makefile
+ldms/src/sampler/lustre_ost/Makefile
 ldms/src/sampler/shm/Makefile
 ldms/src/sampler/shm/shm_util/Makefile
 ldms/src/sampler/shm/mpi_profiler/Makefile
 ldms/src/sampler/cray_system_sampler/Makefile
 ldms/src/sampler/aries_mmr/Makefile
 ldms/src/sampler/aries_mmr/aries_mmr_set_configs/Makefile
+ldms/src/sampler/ibmad/Makefile
 ldms/src/sampler/ibnet/Makefile
+ldms/src/sampler/procnet/Makefile
+ldms/src/sampler/rdc_sampler/Makefile
 ldms/src/sampler/slurm/Makefile
 ldms/src/sampler/spank/Makefile
 ldms/src/sampler/papi/Makefile
 ldms/src/sampler/appinfo_lib/Makefile
 ldms/src/sampler/kgnilnd/Makefile
+ldms/src/sampler/tx2mon/Makefile
 ldms/src/sampler/meminfo/Makefile
 ldms/src/sampler/procinterrupts/Makefile
 ldms/src/sampler/variable/Makefile

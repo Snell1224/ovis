@@ -160,7 +160,7 @@ class LdmsdCmdParser(cmd.Cmd):
                 "auth": "none",
                 "auth_opt": {},
             }
-        r = re.compile("\s*(\w+)=(\w+)")
+        r = re.compile(r"\s*(\w+)=(\w+)")
         for attr, value in r.findall(args):
             if attr in kwargs:
                 kwargs[attr] = value
@@ -356,7 +356,7 @@ class LdmsdCmdParser(cmd.Cmd):
         [interval=] The connection retry interval in micro-seconds. If this is not
                   specified, the previously configured value will be used.
         """
-        self.handle('prdcr_start', arg);
+        self.handle('prdcr_start', arg)
 
     def complete_prdcr_start(self, text, line, begidx, endidx):
         return self.__complete_attr_list('prdcr_start', text)
@@ -369,7 +369,7 @@ class LdmsdCmdParser(cmd.Cmd):
         [interval=]  The connection retry interval in micro-seconds. If this is not
                    specified, the previously configured value will be used.
         """
-        self.handle('prdcr_start_regex', arg);
+        self.handle('prdcr_start_regex', arg)
 
     def complete_prdcr_start_regex(self, text, line, begidx, endidx):
         return self.__complete_attr_list('prdcr_start_regex', text)
@@ -380,7 +380,7 @@ class LdmsdCmdParser(cmd.Cmd):
         Parameters:
         name=  The producer name
         """
-        self.handle('prdcr_stop', arg);
+        self.handle('prdcr_stop', arg)
 
     def complete_prdcr_stop(self, text, line, begidx, endidx):
         return self.__complete_attr_list('prdcr_stop', text)
@@ -391,7 +391,7 @@ class LdmsdCmdParser(cmd.Cmd):
         Parameters:
         regex=   The regular expression
         """
-        self.handle('prdcr_stop_regex', arg);
+        self.handle('prdcr_stop_regex', arg)
 
     def complete_prdcr_stop_regex(self, text, line, begidx, endidx):
         return self.__complete_attr_list('prdcr_stop_regex', text)
@@ -403,7 +403,7 @@ class LdmsdCmdParser(cmd.Cmd):
         regex=     A regular expression matching producer names
         stream=    The stream name
         """
-        self.handle('prdcr_subscribe', arg);
+        self.handle('prdcr_subscribe', arg)
 
     def complete_prdcr_subscribe(self, text, line, begidx, endidx):
         return self.__complete_attr_list('prdcr_subscribe', text)
@@ -415,7 +415,7 @@ class LdmsdCmdParser(cmd.Cmd):
         regex=     A regular expression matching producer names
         stream=    The stream name
         """
-        self.handle('prdcr_unsubscribe', arg);
+        self.handle('prdcr_unsubscribe', arg)
 
     def complete_prdcr_unsubscribe(self, text, line, begidx, endidx):
         return self.__complete_attr_list('prdcr_unsubscribe', text)
@@ -531,7 +531,7 @@ class LdmsdCmdParser(cmd.Cmd):
                            the updater will schedule the set updates according
                            to the default schedule, i.e., the given interval and offset values.
         """
-        self.handle('updtr_start', arg);
+        self.handle('updtr_start', arg)
 
     def complete_updtr_start(self, text, line, begidx, endidx):
         return self.__complete_attr_list('updtr_start', text)
@@ -543,7 +543,7 @@ class LdmsdCmdParser(cmd.Cmd):
         Paramaeters:
         name=   The update policy name
         """
-        self.handle('updtr_stop', arg);
+        self.handle('updtr_stop', arg)
 
     def complete_updtr_stop(self, text, line, begidx, endidx):
         return self.__complete_attr_list('updtr_stop', text)
@@ -630,7 +630,7 @@ class LdmsdCmdParser(cmd.Cmd):
         Start storage policy.
         name=    The storage policy name
         """
-        self.handle('strgp_start', arg);
+        self.handle('strgp_start', arg)
 
     def complete_strgp_start(self, text, line, begidx, endidx):
         return self.__complete_attr_list('strgp_start', text)
@@ -642,7 +642,7 @@ class LdmsdCmdParser(cmd.Cmd):
         Paramaeters:
         name=    The storage policy name
         """
-        self.handle('strgp_stop', arg);
+        self.handle('strgp_stop', arg)
 
     def complete_strgp_stop(self, text, line, begidx, endidx):
         return self.__complete_attr_list('strgp_stop', text)
@@ -1168,7 +1168,7 @@ class LdmsdCmdParser(cmd.Cmd):
         self.handle('setgroup_rm', arg)
         pass
 
-    def complete_setgroup_ins(self, text, line, begidx, endidx):
+    def complete_setgroup_rm(self, text, line, begidx, endidx):
         return self.__complete_attr_list('setgroup_rm', text)
 
     def complete_example(self, text, line, begidx, endidx):
@@ -1228,10 +1228,10 @@ class LdmsdCmdParser(cmd.Cmd):
         return self.__complete_attr_list('set_info', text)
 
     def display_thread_stats(self, stats):
-        print(f"{'Name':16} {'Samples':12} {'Utilization':12}")
-        print("---------------- ------------ ------------")
+        print(f"{'Name':16} {'Samples':12} {'Sample Rate':12} {'Utilization':12}")
+        print("---------------- ------------ ------------ ------------")
         for e in stats['entries']:
-            print(f"{e['name']:16} {e['sample_count']:12.0f} {e['utilization'] * 100:12.2f}")
+            print(f"{e['name']:16} {e['sample_count']:12.0f} {e['sample_rate']:12.2f} {e['utilization'] * 100:12.2f}")
 
     def do_thread_stats(self, arg):
         """
@@ -1253,7 +1253,7 @@ class LdmsdCmdParser(cmd.Cmd):
         {
             "prdcr_count" : <int>,
             "stopped" : <int>,
-            "disconnected" : <int>, 
+            "disconnected" : <int>,
             "connecting" : <int>,
             "connected" : <int>,
             "stopping"	: <int>,
@@ -1288,7 +1288,7 @@ class LdmsdCmdParser(cmd.Cmd):
         {
             "set_count" : <int>,
             "deleting_count" : <int>,
-            "mem_total" : <int>, 
+            "mem_total" : <int>,
             "mem_used" : <int>,
             "mem_free" : <int>,
             "compute_time" : <int>
@@ -1337,7 +1337,8 @@ class LdmsdCmdParser(cmd.Cmd):
             'SET_DELETE': {...},
             'DIR_REQ': {...},
             'DIR_REP': {...},
-            'SEND': {...}
+            'SEND': {...},
+            'RECV': {...}
           }
         }
         """
@@ -1363,7 +1364,7 @@ class LdmsdCmdParser(cmd.Cmd):
         op_stats = stats['op_stats']
         for op_name in op_stats:
             s = op_stats[op_name]
-            print(f"{op_name:12} {s['count']:12} {s['min_us']:12} {s['mean_us']:12} {s['max_us']:12}")                            
+            print(f"{op_name:12} {s['count']:12} {s['min_us']:12} {s['mean_us']:12} {s['max_us']:12}")
 
     def do_xprt_stats(self, arg):
         """
@@ -1451,7 +1452,7 @@ class LdmsdCmdParser(cmd.Cmd):
     def do_listen(self, arg):
         """
         Add a listen endpoint
-        
+
         Parameters:
             xprt=   Transport name [sock, rdma, ugni]
             port=   Port number
@@ -1459,17 +1460,31 @@ class LdmsdCmdParser(cmd.Cmd):
             [auth=] Authenticantion domain.
                     If this is omitted or auth=auth_default is give,
                     the default authentication given the command line (-a and -A)
-                    will be used.. 
+                    will be used..
         """
         self.handle('listen', arg)
 
     def complete_listen(self, text, lien, begidx, endidx):
         return self.__complete_attr_list('listen', text)
 
+    def do_metric_sets_default_authz(self, arg):
+        """
+        Set the default authorization values for subsequently created metric sets
+
+        Parameters:
+            [uid=]  User ID number or user name string
+            [gid=]  Group ID number or group name string
+            [perm=] Octal number representing the permissions bits
+        """
+        self.handle('metric_sets_default_authz', arg)
+
+    def complete_metric_sets_default_authz(self, text, line, begidx, endidx):
+        return self.__complete_attr_list('metric_sets_default_authz', text)
+
     def do_auth_add(self, arg):
         """
         Add an authentication domain
-        
+
         Parameters:
             name=      The authentication domain name
             [plugin=]  The authentication plugin [none, ovis, munge]
@@ -1533,7 +1548,7 @@ if __name__ == "__main__":
                             help = "Execute the script and send the output \
                             commands to the connected ldmsd")
         parser.add_argument('-a', '--auth',
-                            help = "Authentication method.");
+                            help = "Authentication method.")
         parser.add_argument('-A', '--auth-arg', action = 'append',
                             help = "Authentication arguments (name=value). \
                                     This option can be given multiple times.")
@@ -1547,7 +1562,7 @@ if __name__ == "__main__":
         auth_opt = None
         if args.auth_arg:
             auth_opt = dict()
-            rx = re.compile("(\w+)=(.+)")
+            rx = re.compile(r"(\w+)=(.+)")
             for arg in args.auth_arg:
                 m = rx.match(arg)
                 if not m:
@@ -1574,6 +1589,7 @@ if __name__ == "__main__":
                 cmdParser.do_quit(None)
             else:
                 cmdParser.cmdloop("Welcome to the LDMSD control processor")
+                cmdParser.do_quit(None)
     except KeyboardInterrupt:
         sys.exit(0)
     except Exception as e:

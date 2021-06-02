@@ -92,16 +92,6 @@ pthread_mutex_t sp_list_lock = PTHREAD_MUTEX_INITIALIZER;
 #define LDMSD_PLUGIN_LIBPATH_MAX	1024
 struct plugin_list plugin_list;
 
-void ldmsd_cfg_unix_cleanup(ldmsd_cfg_xprt_t xprt)
-{
-	unlink(((struct sockaddr_un *)(&xprt->sock.ss))->sun_path);
-}
-
-void ldmsd_cfg_sock_cleanup(ldmsd_cfg_xprt_t xprt)
-{
-	/* nothing to do */
-}
-
 void ldmsd_cfg_ldms_xprt_cleanup(ldmsd_cfg_xprt_t xprt)
 {
 	/* nothing to do */
@@ -451,9 +441,10 @@ out:
 	return rc;
 }
 
-static int log_response_fn(ldmsd_cfg_xprt_t xprt, char *data, size_t data_len)
+static int log_response_fn(void *_xprt, char *data, size_t data_len)
 {
 	ldmsd_req_attr_t attr;
+	ldmsd_cfg_xprt_t xprt = (ldmsd_cfg_xprt_t)_xprt;
 	ldmsd_req_hdr_t req_reply = (ldmsd_req_hdr_t)data;
 	ldmsd_ntoh_req_msg(req_reply);
 
@@ -537,6 +528,12 @@ oom:
 	return NULL;
 }
 
+static uint64_t __get_cfgfile_id()
+{
+	static uint64_t id = 1;
+	return __sync_fetch_and_add(&id, 1);
+}
+
 /*
  * \param req_filter is a function that returns zero if we want to process the
  *                   request, and returns non-zero otherwise.
@@ -574,13 +571,13 @@ int __process_config_file(const char *path, int *lno, int trust,
 	fin = fopen(path, "rt");
 	if (!fin) {
 		rc = errno;
-		strerror_r(rc, line, line_sz - 1);
 		ldmsd_log(LDMSD_LERROR, "Failed to open the config file '%s'. %s\n",
-				path, buff);
+				path, STRERROR(rc));
 		goto cleanup;
 	}
 
-	xprt.xprt = NULL;
+	xprt.type = LDMSD_CFG_TYPE_FILE;
+	xprt.file.cfgfile_id = __get_cfgfile_id();
 	xprt.send_fn = log_response_fn;
 	xprt.max_msg = LDMSD_CFG_FILE_XPRT_MAX_REC;
 	xprt.trust = trust;
@@ -654,7 +651,7 @@ parse:
 	if (!req_array) {
 		rc = errno;
 		ldmsd_log(LDMSD_LERROR, "Process config file error at line %d "
-				"(%s). %s\n", lineno, path, strerror(rc));
+				"(%s). %s\n", lineno, path, STRERROR(rc));
 		goto cleanup;
 	}
 
@@ -922,7 +919,7 @@ static inline void __log_sent_req(ldmsd_cfg_xprt_t xprt, ldmsd_req_hdr_t req)
 		ldmsd_lall("sending %s msg_no: %d:%lu, flags: %#o, "
 			   "rec_len: %u\n",
 			   ldmsd_req_id2str(hdr.req_id),
-			   hdr.msg_no, (uint64_t)xprt->xprt,
+			   hdr.msg_no, ldms_xprt_conn_id(xprt->ldms.ldms),
 			   hdr.flags, hdr.rec_len);
 		break;
 	case LDMSD_REQ_TYPE_CONFIG_RESP:
@@ -936,8 +933,9 @@ static inline void __log_sent_req(ldmsd_cfg_xprt_t xprt, ldmsd_req_hdr_t req)
 	}
 }
 
-static int send_ldms_fn(ldmsd_cfg_xprt_t xprt, char *data, size_t data_len)
+static int send_ldms_fn(void *_xprt, char *data, size_t data_len)
 {
+	ldmsd_cfg_xprt_t xprt = (ldmsd_cfg_xprt_t)_xprt;
 	__log_sent_req(xprt, (void*)data);
 	return ldms_xprt_send(xprt->ldms.ldms, data, data_len);
 }
@@ -950,6 +948,7 @@ void ldmsd_recv_msg(ldms_t x, char *data, size_t data_len)
 	xprt.send_fn = send_ldms_fn;
 	xprt.max_msg = ldms_xprt_msg_max(x);
 	xprt.trust = 0; /* don't trust any network for CMD expansion */
+	xprt.type = LDMSD_CFG_TYPE_LDMS;
 
 	if (ntohl(request->rec_len) > xprt.max_msg) {
 		/* Send the record length advice */
@@ -969,16 +968,13 @@ void ldmsd_recv_msg(ldms_t x, char *data, size_t data_len)
 	}
 }
 
-/* implemented in ldmsd_request.c */
-void stream_xprt_term(ldms_t x);
-
 static void __listen_connect_cb(ldms_t x, ldms_xprt_event_t e, void *cb_arg)
 {
 	switch (e->type) {
 	case LDMS_XPRT_EVENT_CONNECTED:
 		break;
 	case LDMS_XPRT_EVENT_DISCONNECTED:
-		stream_xprt_term(x);
+		ldmsd_xprt_term(x);
 	case LDMS_XPRT_EVENT_REJECTED:
 	case LDMS_XPRT_EVENT_ERROR:
 		ldms_xprt_put(x);

@@ -8,6 +8,7 @@
 #include <dirent.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include "ovis_util/util.h"
 
 #define PIDFMAX 32
 #define BUFMAX 512
@@ -127,7 +128,8 @@ int parse_proc_pid_stat(struct proc_pid_stat *s, const char *pid) {
 	commstart++;
 	if ((commend - commstart) >= COMM_SZ)
 		return ENAMETOOLONG;
-	strncpy(s->comm, commstart , COMM_SZ);
+	memccpy(s->comm, commstart , 0, COMM_SZ - 1);
+	s->comm[COMM_SZ-1] = 0;
 	rc = sscanf(dat, "%d", &s->pid);
 	if (rc != 1) {
 		return ENOKEY;
@@ -141,7 +143,7 @@ int parse_proc_pid_stat(struct proc_pid_stat *s, const char *pid) {
 		&s->state,
 		&s->ppid,
 		&s->pgrp,
-		&s->session, 
+		&s->session,
 		&s->tty_nr,
 		&s->tpgid,
 		&s->flags,
@@ -311,7 +313,7 @@ void dump_proc_pid_stat(struct proc_pid_stat *s)
 		s->state,
 		s->ppid,
 		s->pgrp,
-		s->session, 
+		s->session,
 		s->tty_nr,
 		s->tpgid,
 		s->flags,
@@ -391,42 +393,42 @@ int main() {
 
 	printf("io test\n");
 	if (rc != 0) {
-		printf("fail: %d %s\n", rc, strerror(rc));
+		printf("fail: %d %s\n", rc, STRERROR(rc));
 		return rc;
 	}
 	dump_proc_pid_io(&si);
 
 	printf("stat test\n");
 	if (rc2 != 0) {
-		printf("fail: %d %s\n", rc2, strerror(rc2));
+		printf("fail: %d %s\n", rc2, STRERROR(rc2));
 		return rc2;
 	}
 	dump_proc_pid_stat(&s);
 
 	printf("statm test\n");
 	if (rc3 != 0) {
-		printf("fail: %d %s\n", rc3, strerror(rc3));
+		printf("fail: %d %s\n", rc3, STRERROR(rc3));
 		return rc3;
 	}
 	dump_proc_pid_statm(&sm);
 
 	printf("fd test\n");
 	if (rc4 != 0) {
-		printf("fail: %d %s\n", rc4, strerror(rc4));
+		printf("fail: %d %s\n", rc4, STRERROR(rc4));
 		return rc4;
 	}
 	dump_proc_pid_fd(&sf);
 
 	printf("fd test details\n");
 	if (rc5 != 0) {
-		printf("fail: %d %s\n", rc5, strerror(rc5));
+		printf("fail: %d %s\n", rc5, STRERROR(rc5));
 		return rc5;
 	}
 	dump_proc_pid_fd(&sfd);
 
 	printf("fd root test details\n");
 	if (rc6 != 0) {
-		printf("xfail: %d %s\n", rc6, strerror(rc6));
+		printf("xfail: %d %s\n", rc6, STRERROR(rc6));
 	} else
 		dump_proc_pid_fd(&rfd);
 

@@ -508,18 +508,21 @@ static void __ep_release(struct z_ugni_ep *uep)
 
 static zap_err_t z_ugni_close(zap_ep_t ep)
 {
+	pthread_t self = pthread_self();
 	struct z_ugni_ep *uep = (struct z_ugni_ep *)ep;
 
 	DLOG_(uep, "Closing xprt: %p, state: %s\n", uep,
 			__zap_ep_state_str(uep->ep.state));
 	pthread_mutex_lock(&uep->ep.lock);
-	uep->ep.state = ZAP_EP_CLOSE;
+	if (self != ep->event_queue->thread) {
+		while (!STAILQ_EMPTY(&uep->sq)) {
+			pthread_cond_wait(&uep->sq_cond, &uep->ep.lock);
+		}
+	}
 	switch (uep->ep.state) {
 	case ZAP_EP_LISTENING:
 	case ZAP_EP_CONNECTED:
 	case ZAP_EP_PEER_CLOSE:
-		shutdown(uep->sock, SHUT_RDWR);
-		break;
 	case ZAP_EP_ERROR:
 	case ZAP_EP_CONNECTING:
 	case ZAP_EP_ACCEPTING:
@@ -531,6 +534,7 @@ static zap_err_t z_ugni_close(zap_ep_t ep)
 		ZAP_ASSERT(0, ep, "%s: Unexpected state '%s'\n",
 				__func__, __zap_ep_state_str(ep->state));
 	}
+	uep->ep.state = ZAP_EP_CLOSE;
 	pthread_mutex_unlock(&uep->ep.lock);
 	return ZAP_ERR_OK;
 }
@@ -642,6 +646,7 @@ static void ugni_sock_write(ovis_event_t ev)
 	if (!wr) {
 		/* sq empty, disable epoll out */
 		__disable_epoll_out(uep);
+		pthread_cond_signal(&uep->sq_cond);
 		goto out;
 	}
 
@@ -2466,6 +2471,7 @@ zap_ep_t z_ugni_new(zap_t z, zap_cb_fn_t cb)
 	uep->rbuff->alen = ZAP_UGNI_INIT_RECV_BUFF_SZ - sizeof(*uep->rbuff);
 
 	STAILQ_INIT(&uep->sq);
+	pthread_cond_init(&uep->sq_cond, NULL);
 	LIST_INIT(&uep->post_desc_list);
 	grc = GNI_EpCreate(_dom.nic, _dom.cq, &uep->gni_ep);
 	if (grc) {
@@ -2976,23 +2982,5 @@ zap_err_t zap_transport_get(zap_t *pz, zap_log_fn_t log_fn,
 
  err:
 	return ZAP_ERR_RESOURCE;
-}
-
-static void __attribute__ ((destructor)) ugni_fini(void);
-static void ugni_fini()
-{
-	gni_return_t grc;
-	struct ugni_mh *mh;
-
-	while (!LIST_EMPTY(&mh_list)) {
-		mh = LIST_FIRST(&mh_list);
-		ZUGNI_LIST_REMOVE(mh, link);
-		(void)GNI_MemDeregister(_dom.nic, &mh->mh);
-		free(mh);
-	}
-
-	grc = GNI_CdmDestroy(_dom.cdm);
-	if (grc != GNI_RC_SUCCESS)
-		LOG("GNI_CdmDestroy failed with error %d\n", grc);
 }
 

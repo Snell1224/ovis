@@ -46,6 +46,7 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+#define _GNU_SOURCE
 #include <sys/errno.h>
 #include <unistd.h>
 #include <stdio.h>
@@ -63,6 +64,8 @@
 #include "coll/rbt.h"
 #include <sys/syscall.h>
 #include <netdb.h>
+#include <time.h>
+#include <pthread.h>
 #include "zap_rdma.h"
 
 #define LOG(FMT, ...)							\
@@ -771,6 +774,7 @@ static void flush_io_q(struct z_rdma_ep *rep)
 		__rdma_context_free(ctxt);
 		pthread_mutex_unlock(&rep->ep.lock);
 	}
+	pthread_cond_signal(&rep->io_q_cond);
 
 }
 
@@ -925,6 +929,7 @@ static void submit_pending(struct z_rdma_ep *rep)
 		pthread_mutex_unlock(&rep->ep.lock);
 		pthread_mutex_lock(&rep->credit_lock);
 	}
+	pthread_cond_signal(&rep->io_q_cond);
  out:
 	pthread_mutex_unlock(&rep->credit_lock);
 }
@@ -976,6 +981,16 @@ static zap_err_t __rdma_post_send(struct z_rdma_ep *rep, struct z_rdma_buffer *r
 static zap_err_t z_rdma_close(zap_ep_t ep)
 {
 	struct z_rdma_ep *rep = (struct z_rdma_ep *)ep;
+	pthread_t self = pthread_self();
+
+	if (self != ep->event_queue->thread) {
+		pthread_mutex_lock(&rep->credit_lock);
+		while (!TAILQ_EMPTY(&rep->io_q)) {
+			pthread_cond_wait(&rep->io_q_cond, &rep->credit_lock);
+		}
+		pthread_mutex_unlock(&rep->credit_lock);
+	}
+
 	pthread_mutex_lock(&rep->ep.lock);
 	if (!rep->cm_id)
 		goto out;
@@ -1627,6 +1642,7 @@ static zap_ep_t z_rdma_new(zap_t z, zap_cb_fn_t cb)
 	rep->sq_credits = SQ_DEPTH;
 
 	TAILQ_INIT(&rep->io_q);
+	pthread_cond_init(&rep->io_q_cond, NULL);
 	LIST_INIT(&rep->active_ctxt_list);
 	pthread_mutex_init(&rep->credit_lock, NULL);
 	return (zap_ep_t)&rep->ep;
@@ -2636,14 +2652,32 @@ zap_err_t zap_transport_get(zap_t *pz, zap_log_fn_t log_fn,
 	return ZAP_ERR_RESOURCE;
 }
 
+#define ZAP_RDMA_JOIN_TIMEOUT_DEFAULT 5 /* 5 sec */
 static void __attribute__ ((destructor)) zap_rdma_fini(void)
 {
+	struct timespec t;
+	struct timespec to;
+	char *s = getenv("ZAP_RDMA_JOIN_TIMEOUT_NSEC");
+	if (s) {
+		long v = strtol(s, NULL, 0);
+		to.tv_sec = v / 1000000;
+		to.tv_nsec = v % 1000000;
+	} else {
+		to.tv_sec = ZAP_RDMA_JOIN_TIMEOUT_DEFAULT;
+		to.tv_nsec = 0;
+	}
 	if (cq_thread) {
 		pthread_cancel(cq_thread);
-		pthread_join(cq_thread, NULL);
+		clock_gettime(CLOCK_REALTIME, &t);
+		t.tv_sec += to.tv_sec;
+		t.tv_nsec += to.tv_nsec;
+		pthread_timedjoin_np(cq_thread, NULL, &t);
 	}
 	if (cm_thread) {
 		pthread_cancel(cm_thread);
-		pthread_join(cm_thread, NULL);
+		clock_gettime(CLOCK_REALTIME, &t);
+		t.tv_sec += to.tv_sec;
+		t.tv_nsec += to.tv_nsec;
+		pthread_timedjoin_np(cm_thread, NULL, &t);
 	}
 }

@@ -49,6 +49,7 @@
 
 
 #define PLUGNAME 0
+#define _GNU_SOURCE
 #define store_csv_common_lib
 #include <stdlib.h>
 #include <stdio.h>
@@ -122,108 +123,6 @@ int replace_string(char **strp, const char *val)
 	return ENOMEM;
 }
 
-/* get a handle to the onp we should use. return NULL only if no notify configured anywhere. */
-static struct ovis_notification **get_onph(struct csv_store_handle_common *s_handle,
-	struct csv_plugin_static *cps)
-{
-	if (!s_handle->notify)
-		return NULL;
-	uint32_t wto = 6000;
-	unsigned mqs = 1000;
-	unsigned retry = 10;
-	mode_t perm = 0700;
-	/* init if unopened */
-	if (s_handle->notify && s_handle->onp == NULL) {
-		bool fifo = s_handle->notify_isfifo;
-		s_handle->onp = ovis_notification_open(s_handle->notify,
-				wto, mqs, retry,
-				(ovis_notification_log_fn)cps->msglog,
-				perm, fifo);
-		if (s_handle->onp)
-			cps->msglog(LDMSD_LDEBUG,"Created onp %s\n",
-				s_handle->notify);
-		else
-			cps->msglog(LDMSD_LDEBUG,"Create fail for sh.onp %s\n",
-				s_handle->notify);
-	}
-	if (s_handle->onp)
-		return &(s_handle->onp);
-	else
-		return NULL;
-}
-
-void notify_output(const char *event, const char *name, const char *ftype,
-	struct csv_store_handle_common *s_handle, struct csv_plugin_static *cps) {
-	if (!cps)
-		return;
-	if (s_handle && !s_handle->notify)
-		return;
-	const char *container = s_handle->container;
-	const char *schema = s_handle->schema;
-	if (!event || !name || !ftype || !s_handle) {
-		cps->msglog(LDMSD_LDEBUG,"Invalid argument in notify_output"
-				"(%s, %s, %s, %p, %p)\n",
-				event ? event : "missing event",
-				name ? name : "missing name",
-				ftype ? ftype : "missing ftype",
-				container ? container : "missing container",
-				schema ? schema : "missing schema",
-				s_handle, cps);
-		return;
-	}
-	struct ovis_notification **onph = get_onph(s_handle, cps);
-	if (! onph || ! *onph) {
-		cps->msglog(LDMSD_LDEBUG,"onp not set in handle or cps\n");
-		return;
-	}
-
-	int *hcp = (NULL != s_handle->onp) ? &(s_handle->hooks_closed) :
-						&(cps->hooks_closed);
-	char *msg;
-	if (*hcp) {
-		cps->msglog(LDMSD_LINFO, "Request by storecsv with output closed: %s\n",
-			s_handle->notify);
-		return;
-	}
-	dsinit(ds);
-	dscat(ds,event);
-	dscat(ds," ");
-	dscat(ds,cps->pname);
-	dscat(ds," ");
-	dscat(ds,container);
-	dscat(ds," ");
-	dscat(ds,schema);
-	dscat(ds," ");
-	dscat(ds,ftype);
-	dscat(ds," ");
-	dscat(ds,name);
-	msg = dsdone(ds);
-	if (!msg) {
-		cps->msglog(LDMSD_LERROR,
-			"Out of memory in notify_output for %s\n",name);
-		return;
-	}
-	int rc = ovis_notification_add(*onph, msg);
-	switch (rc) {
-	case 0:
-		cps->msglog(LDMSD_LDEBUG,"Notification of %s\n", msg);
-		break;
-	case EINVAL:
-		cps->msglog(LDMSD_LERROR,"Notification error by %s for %s: %s\n",
-			cps->pname, name, msg);
-		break;
-	case ESHUTDOWN:
-		cps->msglog(LDMSD_LERROR,"Disconnected output detected. Closing.\n");
-		ovis_notification_close(*onph);
-		*hcp = 1;
-		*onph = NULL;
-		break;
-	default:
-		cps->msglog(LDMSD_LERROR,"Unexpected error type %d in notify_spool\n",rc);
-	}
-	free(msg);
-}
-
 /* Disallow odd characters and space in environment variables
  * for template assembly.
  * Allow A-z0-9%@()+-_./:=
@@ -263,8 +162,6 @@ static int validate_env(const char *var, const char *val, struct csv_plugin_stat
 
 int create_outdir(const char *path, struct csv_store_handle_common *s_handle,
 	struct csv_plugin_static *cps) {
-#define EBSIZE 512
-	char errbuf[EBSIZE];
 	if (!cps) {
 		return EINVAL;
 	}
@@ -296,23 +193,19 @@ int create_outdir(const char *path, struct csv_store_handle_common *s_handle,
 		case EEXIST:
 			break;
 		default:
-			strerror_r(err, errbuf, EBSIZE);
 			cps->msglog(LDMSD_LERROR,"create_outdir: failed to create directory for %s: %s\n",
-				path, errbuf);
+				path, STRERROR(err));
 			return err;
 		}
 	}
 
 	/* cps->msglog(LDMSD_LDEBUG,"create_outdir: f_mkdir+p(%s, %o)\n", path, mode); */
 	return 0;
-#undef EBSIZE
 }
 
 void rename_output(const char *name,
 	const char *ftype, struct csv_store_handle_common *s_handle,
 	struct csv_plugin_static *cps) {
-#define EBSIZE 512
-	char errbuf[EBSIZE];
 	if (!cps) {
 		return;
 	}
@@ -342,9 +235,9 @@ void rename_output(const char *name,
 		int merr = chmod(name, mode);
 		int rc = errno;
 		if (merr) {
-			strerror_r(rc, errbuf, EBSIZE);
 			cps->msglog(LDMSD_LERROR,"%s: rename_output: unable to chmod(%s,%o): %s.\n",
-				cps->pname, name, s_handle->rename_perm, errbuf);
+				cps->pname, name, s_handle->rename_perm,
+				STRERROR(rc));
 		}
 	}
 
@@ -356,9 +249,8 @@ void rename_output(const char *name,
 		int merr = chown(name, newuid, newgid);
 		int rc = errno;
 		if (merr) {
-			strerror_r(rc, errbuf, EBSIZE);
 			cps->msglog(LDMSD_LERROR,"%s: rename_output: unable to chown(%s, %u, %u): %s.\n",
-				cps->pname, name, newuid, newgid, errbuf);
+				cps->pname, name, newuid, newgid, STRERROR(rc));
 		}
 	}
 
@@ -509,9 +401,8 @@ void rename_output(const char *name,
 		case EEXIST:
 			break;
 		default:
-			strerror_r(err, errbuf, EBSIZE);
 			cps->msglog(LDMSD_LERROR, "%s: rename_output: failed to create directory for %s: %s\n",
-				cps->pname, newname, errbuf);
+				cps->pname, newname, STRERROR(err));
 			free(newname);
 			return;
 		}
@@ -523,22 +414,15 @@ void rename_output(const char *name,
 	err = rename(name, newname);
 	if (err) {
 		int ec = errno;
-		if (ec != ENOENT) {
-			strerror_r(ec, errbuf, EBSIZE);
-			cps->msglog(LDMSD_LERROR,"%s: rename_output: failed rename(%s, %s): %s\n",
-				cps->pname, name, newname, errbuf);
-		}
-		/* enoent happens if altheader = 0 or typeheader = 0 */
+		cps->msglog(LDMSD_LERROR,"%s: rename_output: failed rename(%s, %s): %s\n",
+			    cps->pname, name, newname, STRERROR(ec));
 	}
 	free(newname);
-#undef EBSIZE
 }
 
 void ch_output(FILE *f, const char *name,
 	struct csv_store_handle_common *s_handle,
 	struct csv_plugin_static *cps) {
-#define EBSIZE 512
-	char errbuf[EBSIZE];
 	if (!cps) {
 		return;
 	}
@@ -560,9 +444,8 @@ void ch_output(FILE *f, const char *name,
 		int merr = fchmod(fd, mode);
 		int rc = errno;
 		if (merr) {
-			strerror_r(rc, errbuf, EBSIZE);
 			cps->msglog(LDMSD_LERROR,"ch_output: unable to chmod(%s,%o): %s.\n",
-				name, s_handle->create_perm, errbuf);
+				name, s_handle->create_perm, STRERROR(rc));
 		}
 	}
 
@@ -574,12 +457,11 @@ void ch_output(FILE *f, const char *name,
 		int merr = fchown(fd, newuid, newgid);
 		int rc = errno;
 		if (merr) {
-			strerror_r(rc, errbuf, EBSIZE);
 			cps->msglog(LDMSD_LERROR,"ch_output: unable to fchown(%d, (%s),%lu, %lu): %s.\n",
-				fd, name, newuid, newgid, errbuf);
+				fd, name, newuid, newgid, STRERROR(rc));
 		}
 		cps->msglog(LDMSD_LDEBUG,"ch_output: fchown(%d, (%s),%lu, %lu): %s.\n",
-			fd, name, newuid, newgid, errbuf);
+			fd, name, newuid, newgid, STRERROR(rc));
 	}
 }
 
@@ -842,36 +724,8 @@ int open_store_common(struct plugattr *pa, struct csv_store_handle_common *s_han
 
 	int rc = 0;
 	const char *k = s_handle->store_key;
-	const char *notify;
-	notify = ldmsd_plugattr_value(pa, "notify", k);
-	if (notify && strlen(notify) >= 2 ) {
-		char *tmp1 = strdup(notify);
-		if (!tmp1) {
-			rc = ENOMEM;
-			return rc;
-		} else {
-			s_handle->notify = tmp1;
-		}
-	} else {
-		if (notify) {
-			cps->msglog(LDMSD_LERROR, "%s %s: notify "
-				"must be specificed correctly. "
-				"got instead %s\n", cps->pname, k, notify);
-			rc = EINVAL;
-			return rc;
-		}
-	}
 	int32_t cvt;
 	bool r;
-	if (!rc) {
-		r = false;
-		cvt = ldmsd_plugattr_bool(pa, "notify_isfifo", k, &r);
-		if (cvt == -1) {
-			cps->msglog(LDMSD_LERROR, "%s:%s: notify_isfifo cannot be parsed.\n", cps->pname, k);
-			return EINVAL;
-		}
-		s_handle->notify_isfifo = r;
-	}
 
 	/* -1 means do not change */
 	s_handle->create_uid = (uid_t)-1;
@@ -1045,24 +899,21 @@ void close_store_common(struct csv_store_handle_common *s_handle, struct csv_plu
 		return;
 	}
 
-	notify_output(NOTE_CLOSE, s_handle->filename, NOTE_DAT, s_handle, cps);
-	notify_output(NOTE_CLOSE, s_handle->headerfilename, NOTE_HDR, s_handle,
-		cps);
-	rename_output(s_handle->filename, NOTE_DAT, s_handle, cps);
-	rename_output(s_handle->headerfilename, NOTE_HDR, s_handle, cps);
-	rename_output(s_handle->typefilename, NOTE_KIND, s_handle, cps);
+	rename_output(s_handle->filename, FTYPE_DATA, s_handle, cps);
+	if (s_handle->altheader)
+		rename_output(s_handle->headerfilename, FTYPE_HDR, s_handle, cps);
+	if (s_handle->typeheader)
+		rename_output(s_handle->typefilename, FTYPE_KIND, s_handle, cps);
 	replace_string(&(s_handle->filename), NULL);
 	replace_string(&(s_handle->headerfilename),  NULL);
 	replace_string(&(s_handle->typefilename),  NULL);
-	/* free(s_handle->notify); skip. handle notify is always copy of pg or sk notify or null */
-	s_handle->notify = NULL;
 	free(s_handle->rename_template);
 	s_handle->rename_template = NULL;
 }
 
 void print_csv_plugin_common(struct csv_plugin_static *cps)
 {
-	cps->msglog(LDMSD_LALL, "%s: onp: %p\n", cps->pname, cps->onp);
+	cps->msglog(LDMSD_LALL, "%s:\n", cps->pname);
 }
 
 void print_csv_store_handle_common(struct csv_store_handle_common *h, struct csv_plugin_static *p)
@@ -1077,9 +928,6 @@ void print_csv_store_handle_common(struct csv_store_handle_common *h, struct csv
 	p->msglog(LDMSD_LALL, "%s: filename: %s\n", p->pname, h->filename);
 	p->msglog(LDMSD_LALL, "%s: headerfilename: %s\n", p->pname, h->headerfilename);
 	p->msglog(LDMSD_LALL, "%s: typefilename: %s\n", p->pname, h->typefilename);
-	p->msglog(LDMSD_LALL, "%s: notify:%s\n", p->pname, h->notify);
-	p->msglog(LDMSD_LALL, "%s: notify_isfifo:%s\n", p->pname, h->notify_isfifo ?
-			                "true" : "false");
 	p->msglog(LDMSD_LALL, "%s: altheader:%s\n", p->pname, h->altheader ?
 			                "true" : "false");
 	p->msglog(LDMSD_LALL, "%s: typeheader:%d\n", p->pname, h->typeheader);
@@ -1092,5 +940,4 @@ void print_csv_store_handle_common(struct csv_store_handle_common *h, struct csv
 	p->msglog(LDMSD_LALL, "%s: create_uid: %" PRIu32 "\n", p->pname, h->create_uid);
 	p->msglog(LDMSD_LALL, "%s: create_gid: %" PRIu32 "\n", p->pname, h->create_gid);
 	p->msglog(LDMSD_LALL, "%s: create_perm: %o\n", p->pname, h->create_perm);
-	p->msglog(LDMSD_LALL, "%s: onp: %p\n", p->pname, h->onp);
 }

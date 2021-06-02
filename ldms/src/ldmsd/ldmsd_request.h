@@ -120,9 +120,8 @@ enum ldmsd_request {
 	LDMSD_THREAD_STATS_REQ,
 	LDMSD_PRDCR_STATS_REQ,
 	LDMSD_SET_STATS_REQ,
-
-	/* command-line options */
 	LDMSD_LISTEN_REQ,
+	LDMSD_SET_DEFAULT_AUTHZ_REQ,
 
 	/* failover requests by user */
 	LDMSD_FAILOVER_CONFIG_REQ = 0x700, /* "failover_config" user command */
@@ -228,31 +227,28 @@ typedef struct ldmsd_req_hdr_s {
 #pragma pack(pop)
 
 /**
- * The format of requests and replies is as follows:
+ * The format of requests and replies is as follows.
+ *
+ * Note that "attr_id" is usually one of the values in
+ * enum ldmsd_request_attr. However, the values in ldmsd_request_attr
+ * do not have a prescribed meaning or data type. The meaning and data
+ * type are left to the implementation of each individual message.
  *
  *                 Standard Record Format
  * +---------------------------------------------------------+
  * | ldmsd_req_hdr_s                                         |
  * +---------------------------------------------------------+
- * | attr_0, attr_discrim == 1                               |
+ * | ldmsd_req_attr_s: discrim=1, attr_id=?                  |
  * +---------------------------------------------------------+
- * S                                                         |
- * +---------------------------------------------------------+
- * | attr_N, attr_discrim == 1                               |
- * +---------------------------------------------------------+
- * | attr_discrim == 0, remaining fields are not present     |
- * +---------------------------------------------------------+
- *
- *                 String Record Format
- * +---------------------------------------------------------+
- * | ldmsd_req_hdr_s                                         |
- * +---------------------------------------------------------+
- * | String bytes, i.e. attr_discrim > 1                     |
- * | length is rec_len - sizeof(ldmsd_req_hdr_s)             |
  * S                                                         S
+ * +---------------------------------------------------------+
+ * | ldmsd_req_attr_s: discrim=1, attr_id=?                  |
+ * +---------------------------------------------------------+
+ * | ldmsd_req_attr_s: discrim=0, (end of attributes)        |
  * +---------------------------------------------------------+
  */
 typedef struct req_ctxt_key {
+	uint8_t flags;
 	uint32_t msg_no;
 	uint64_t conn_id;
 } *msg_key_t;
@@ -264,27 +260,24 @@ typedef struct ldmsd_cfg_ldms_s {
 	ldms_t ldms;
 } *ldmsd_cfg_ldms_t;
 
-typedef struct ldmsd_cfg_sock_s {
-	int fd;
-	struct sockaddr_storage ss;
-} *ldmsd_cfg_sock_t;
-
 typedef struct ldmsd_cfg_file_s {
-	uint32_t next_msg_no;
+	uint64_t cfgfile_id;
 } *ldmsd_cfg_file_t;
 
 struct ldmsd_cfg_xprt_s;
-typedef int (*ldmsd_cfg_send_fn_t)(struct ldmsd_cfg_xprt_s *xprt, char *data, size_t data_len);
+typedef int (*ldmsd_msg_send_fn_t)(void *xprt, char *data, size_t data_len);
 typedef void (*ldmsd_cfg_cleanup_fn_t)(struct ldmsd_cfg_xprt_s *xprt);
 typedef struct ldmsd_cfg_xprt_s {
+	enum {
+		LDMSD_CFG_TYPE_FILE,
+		LDMSD_CFG_TYPE_LDMS,
+	} type;
 	union {
-		void *xprt;
 		struct ldmsd_cfg_file_s file;
-		struct ldmsd_cfg_sock_s sock;
 		struct ldmsd_cfg_ldms_s ldms;
 	};
 	size_t max_msg;
-	ldmsd_cfg_send_fn_t send_fn;
+	ldmsd_msg_send_fn_t send_fn;
 	ldmsd_cfg_cleanup_fn_t cleanup_fn;
 	int trust; /* trust (to perform command expansion) */
 	int rsp_err; /* error from the response */
@@ -292,6 +285,13 @@ typedef struct ldmsd_cfg_xprt_s {
 
 #define LINE_BUF_LEN 1024
 #define REQ_BUF_LEN 4096
+
+struct ldmsd_msg_buf {
+	char *buf;
+	size_t off;
+	size_t len;
+	uint32_t flags;
+};
 
 typedef struct ldmsd_req_ctxt {
 	struct req_ctxt_key key;
@@ -302,8 +302,6 @@ typedef struct ldmsd_req_ctxt {
 
 	void *ctxt;
 
-	int rec_no;
-
 	uint32_t errcode;
 	uint32_t req_id;
 
@@ -311,13 +309,10 @@ typedef struct ldmsd_req_ctxt {
 	size_t line_off;
 	char *line_buf;
 
-	size_t req_len;
-	size_t req_off;
+	struct ldmsd_msg_buf *_req_buf;
 	char *req_buf;
 
-	size_t rep_len;
-	size_t rep_off;
-	char *rep_buf;
+	struct ldmsd_msg_buf *rep_buf;
 } *ldmsd_req_ctxt_t;
 
 typedef struct ldmsd_req_cmd *ldmsd_req_cmd_t;
@@ -327,12 +322,14 @@ struct ldmsd_req_cmd {
 	ldmsd_req_ctxt_t org_reqc; /* The original request context */
 	ldmsd_req_resp_fn resp_handler; /* Pointer to the function to handle the response */
 	void *ctxt;
+	int msg_flags;
 };
 
 #pragma pack(push, 1)
 typedef struct ldmsd_req_attr_s {
-	uint32_t discrim;	/* If 0, the remaining fields are not present */
-	uint32_t attr_id;	/* Attribute identifier, unique per ldmsd_req_hdr_s.cmd_id */
+	uint32_t discrim;	/* If 0, marks end of of attributes fields */
+	uint32_t attr_id;	/* Generally one of enum ldmsd_request_attr, but interpretation
+				   is left to the request that envelopes this attribute */
 	uint32_t attr_len;	/* Size of value in bytes */
 	union {
 		uint8_t attr_value[OVIS_FLEX_UNION];
@@ -376,7 +373,7 @@ struct ldmsd_req_array *ldmsd_parse_config_str(const char *cfg, uint32_t msg_no,
 					size_t xprt_max_msg, ldmsd_msg_log_f msglog);
 
 /**
- * \brief Destroy the result of ldmsd_parse_config_str.
+ * \brief Destroy the result of ldmsd_parse_config_str. Ignores NULL input.
  */
 void ldmsd_req_array_free(struct ldmsd_req_array *a);
 
@@ -509,6 +506,7 @@ int ldmsd_append_reply(struct ldmsd_req_ctxt *reqc, const char *data, size_t dat
 void ldmsd_send_error_reply(ldmsd_cfg_xprt_t xprt, uint32_t msg_no,
 			    uint32_t error, char *data, size_t data_len);
 void ldmsd_send_req_response(ldmsd_req_ctxt_t reqc, const char *msg);
+int validate_ldmsd_req(ldmsd_req_ctxt_t reqc, ldmsd_req_hdr_t rh);
 int ldmsd_handle_request(ldmsd_req_ctxt_t reqc);
 static inline ldmsd_req_attr_t ldmsd_first_attr(ldmsd_req_hdr_t rh)
 {
@@ -556,7 +554,7 @@ ldmsd_req_cmd_t ldmsd_req_cmd_new(ldms_t ldms,
 				    void *ctxt);
 
 /**
- * \brief Free the request command.
+ * \brief Free the request command. Ignores NULL input.
  */
 void ldmsd_req_cmd_free(ldmsd_req_cmd_t rcmd);
 
@@ -607,5 +605,64 @@ int ldmsd_req_cmd_attr_term(ldmsd_req_cmd_t rcmd)
 {
 	return ldmsd_req_cmd_attr_append(rcmd, LDMSD_ATTR_TERM, NULL, 0);
 }
+
+/**
+ * \brief Return a unique ID
+ */
+uint32_t ldmsd_msg_no_get();
+
+/**
+ * \brief Create a new LDMSD buffer
+ *
+ * \param len   Size of the buffer
+ */
+struct ldmsd_msg_buf *ldmsd_msg_buf_new(size_t len);
+
+/**
+ * \brief Reset the message buffer \c buf
+ *
+ * \param buf   Buffer to be reset
+ */
+void ldmsd_msg_buf_init(struct ldmsd_msg_buf *buf);
+
+/**
+ * \brief Free an LDMSD message buffer. Ignores NULL input.
+ */
+void ldmsd_msg_buf_free(struct ldmsd_msg_buf *buf);
+
+/**
+ * \brief Append and send data to an LDMSD message buffer
+ *
+ * \c data is appended to \c buf. \c data is sent when the buffer is full or
+ * \c flags includes LDMSD_REQ_EOM_F. If \c data_len is larger than the space left
+ * in \c buf, \c data is chunked to the \c buf size and sent to the peer.
+ *
+ * \param buf        Buffer to append
+ * \param xprt       Transport
+ * \param msg_no     Unique message number
+ * \param send_fn    Send function
+ * \param msg_flags  bit-wise OR of a combination of LDMSD_REQ_SOM_F, LDMSD_REQ_EOM_F, and 0
+ * \param data       data to be appended and sent
+ * \param data_len   data length
+ *
+ */
+int ldmsd_msg_buf_send(struct ldmsd_msg_buf *buf,
+			void *xprt, uint32_t msg_no,
+			ldmsd_msg_send_fn_t send_fn,
+			int msg_flags, int msg_type,
+			uint32_t req_id_n_rsp_err,
+			const char *data, size_t data_len);
+
+/**
+ * \brief Gather records into a message
+ *
+ * \param buf   Buffer to store multiple records
+ * \param req   Record header
+ *
+ * \return 0 if the message is complete. EBUSY if more records are expected.
+ *         Otherwise, there is an error.
+ */
+int ldmsd_msg_gather(struct ldmsd_msg_buf *buf, ldmsd_req_hdr_t req);
+
 
 #endif /* LDMS_SRC_LDMSD_LDMSD_REQUEST_H_ */
