@@ -43,6 +43,7 @@ html_logo = "images/ovis-logo.png"
 html_theme_options = {
     'logo_only': True,
     'display_version': False,
+    'logo_url': "https://ovis-hpc-personal.readthedocs.io/en/latest/",
 }
 
 # -- Options for EPUB output
