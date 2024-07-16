@@ -24,11 +24,11 @@ intersphinx_mapping = {
     'sphinx': ('https://www.sphinx-doc.org/en/master/', None),
     
     # Link to the "apis" of the "hpc-ovis" project and subprojects
-    "ovis-hpc": ("https://ovis-hpc-personal.readthedocs.io/en/latest/", None),
-    "sos": ("https://ovis-hpc-personal.readthedocs.io/projects/sos/en/latest/", None),
-    "maestro": ("https://ovis-hpc-personal.readthedocs.io/projects/maestro/en/latest/", None),
-    "baler": ("https://ovis-hpc-personal.readthedocs.io/projects/baler/en/latest/", None),
-    "ldms": ("https://ovis-hpc-personal.readthedocs.io/projects/ldms/en/latest/", None),
+    "ovis-hpc": ("https://ovis-hpc.readthedocs.io/en/latest/", None),
+    "sos": ("https://ovis-hpc.readthedocs.io/projects/sos/en/latest/", None),
+    "maestro": ("https://ovis-hpc.readthedocs.io/projects/maestro/en/latest/", None),
+    "baler": ("https://ovis-hpc.readthedocs.io/projects/baler/en/latest/", None),
+    "ldms": ("https://ovis-hpc.readthedocs.io/projects/ldms/en/latest/", None),
 
 }
 intersphinx_disabled_domains = ['std']
