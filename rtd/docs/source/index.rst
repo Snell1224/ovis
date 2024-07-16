@@ -8,49 +8,50 @@
    You can adapt this file completely to your liking, but it should at least
    contain the root `toctree` directive.
 
-Welcome To LDMS Documentation!
+Welcome To OVIS-HPC Documentation!
+====================================
+.. image:: images/ovis-logo.png
+   :width: 225
+   :height: 250
+   :align: center
+
+**OVIS** is a modular system for HPC data collection, transport, storage, analysis, visualization, and log message exploration. The Lightweight Distributed Metric Service (**LDMS**) is a scalable low-overhead, low-latency framework for collection, movement, and storage of metric/event data on distributed computer systems.
+
+.. toctree::
+   :maxdepth: 2
+   :caption: OVIS and Group Activity
+
+   About Ovis <https://ovis-hpc-personal.readthedocs.io/en/latest/aboutovis.html>
+   LDMS Users Group Conference <https://ovis-hpc-personal.readthedocs.io/projects/ldms/en/latest/ldmscon.html>
+   LDSM Users Group <https://ovis-hpc-personal.readthedocs.io/projects/ldms/en/latest/ug.html>
+   publications <https://ovis-hpc-personal.readthedocs.io/en/latest/publications.html>
+
+.. toctree::
+   :maxdepth: 4
+   :caption: OVIS Components
+
+   ldms-index
+   SOS <https://ovis-hpc-personal.readthedocs.io/projects/sos/en/latest/sos-index.html>
+   Maestro <https://ovis-hpc-personal.readthedocs.io/projects/maestro/en/latest/maestro-index.html>
+   Baler <https://ovis-hpc-personal.readthedocs.io/projects/baler/en/latest/baler-index.html>
+   asf/index
+   deployment/index
+   
+Other Projects
 ====================================
 
-.. image:: images/ovis-hpc_homepage.png
-   :width: 1000
-   :height: 150
+`ldms <https://github.com/ovis-hpc/ovis>`_
+`ovis-publications <https://github.com/ovis-hpc/ovis-publications>`_
+`maestro <https://github.com/ovis-hpc/maestro>`_
+`sos <https://github.com/ovis-hpc/sos>`_
+`baler <https://github.com/ovis-hpc/baler>`_
 
-LDMS GitHub: https://github.com/ovis-hpc/ovis
-
-To join the LDMS Users Group Mailing List: https://github.com/ovis-hpc/ovis-wiki/wiki/Mailing-Lists
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Introduction To LDMS
-
-   ldms-quickstart
-   ldms-tutorial
-   ldms-streams
-   container-quickstart
-
-.. toctree::
-   :maxdepth: 2
-   :caption: LDMS Man Pages
-
-   ldms_man/index
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Sampler Plugin Man Pages
-
-   sampler_man/index
-
-.. toctree::
-   :maxdepth: 2
-   :caption: Store Plugin Man Pages
-
-   store_man/index
+   
 
 
-.. toctree::
-   :maxdepth: 2
-   :caption: Contributing to LDMS
 
-   contributing/index 
+
+
+
 
 

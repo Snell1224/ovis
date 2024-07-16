@@ -3,7 +3,7 @@
 # -- Project information
 
 project = 'OVIS-HPC'
-copyright = '2023, Sandia National Laboratories and Open Grid Computing, Inc.'
+copyright = '2024, Sandia National Laboratories and Open Grid Computing, Inc.'
 author = 'SNL/OGC'
 
 release = '0.1'
@@ -22,8 +22,9 @@ extensions = [
 intersphinx_mapping = {
     'python': ('https://docs.python.org/3/', None),
     'sphinx': ('https://www.sphinx-doc.org/en/master/', None),
+    
+    # Link to the "apis" of the "hpc-ovis" project and subprojects
     "ovis-hpc": ("https://ovis-hpc-personal.readthedocs.io/en/latest/", None),
-    # Link to the subprojects of the "hpc-ovis" project.
     "sos": ("https://ovis-hpc-personal.readthedocs.io/projects/sos/en/latest/", None),
     "maestro": ("https://ovis-hpc-personal.readthedocs.io/projects/maestro/en/latest/", None),
     "baler": ("https://ovis-hpc-personal.readthedocs.io/projects/baler/en/latest/", None),
@@ -39,11 +40,10 @@ templates_path = ['_templates']
 
 html_theme = 'sphinx_rtd_theme'
 html_static_path = ['static']
-html_logo = "images/ovis-logo.png"
+html_logo = "https://github.com/ovis-hpc/readthedocs/blob/main/docs/source/images/ovis-logo.png?raw=true"
 html_theme_options = {
     'logo_only': True,
     'display_version': False,
-    'logo_url': "https://ovis-hpc-personal.readthedocs.io/en/latest/",
 }
 
 # -- Options for EPUB output
