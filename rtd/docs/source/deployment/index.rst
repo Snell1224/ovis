@@ -1,6 +1,6 @@
 LDMS Deployment
 ===============
-This section covers how to deploy and test the OVIS projects (i.e. ldms, meastro, sos, etc.)
+This section covers how to deploy and test LDMS
 
 .. toctree::
    :maxdepth: 2
