@@ -22,9 +22,9 @@ Welcome To OVIS-HPC Documentation!
    :caption: OVIS and Group Activity
 
    About Ovis <https://ovis-hpc-personal.readthedocs.io/en/latest/aboutovis.html>
-   LDMS Users Group Conference <https://ovis-hpc-personal.readthedocs.io/projects/ldms/en/latest/ldmscon.html>
+   LDMS Users Group Conference (LDMSCON) <https://ovis-hpc-personal.readthedocs.io/projects/ldms/en/latest/ldmscon.html>
    LDSM Users Group <https://ovis-hpc-personal.readthedocs.io/projects/ldms/en/latest/ug.html>
-   publications <https://ovis-hpc-personal.readthedocs.io/en/latest/publications.html>
+   OVIS Publications <https://ovis-hpc-personal.readthedocs.io/en/latest/publications.html>
 
 .. toctree::
    :maxdepth: 4
@@ -35,7 +35,17 @@ Welcome To OVIS-HPC Documentation!
    Maestro <https://ovis-hpc-personal.readthedocs.io/projects/maestro/en/latest/maestro-index.html>
    Baler <https://ovis-hpc-personal.readthedocs.io/projects/baler/en/latest/baler-index.html>
    asf/index
+
+.. toctree::
+   :maxdepth: 6
+   :caption: Deployment
+
    deployment/index
+   SOS <https://ovis-hpc-personal.readthedocs.io/projects/sos/en/latest/deployment/index.html>
+   Maestro <https://ovis-hpc-personal.readthedocs.io/projects/maestro/en/latest/deployment/index.html>
+   Baler <https://ovis-hpc-personal.readthedocs.io/projects/baler/en/latest/deployment/index.html>
+   asf/deployment/index
+
    
 Other Projects
 ====================================
