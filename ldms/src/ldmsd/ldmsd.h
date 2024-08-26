@@ -340,7 +340,6 @@ struct ldmsd_stat {
 typedef struct ldmsd_prdcr_set {
 	char *inst_name;
 	char *schema_name;
-	char *producer_name;
 	ldmsd_prdcr_t prdcr;
 	ldms_set_t set;
 	int push_flags;
@@ -392,9 +391,6 @@ typedef struct ldmsd_prdcr_listen {
 	} state;
 	const char *hostname_regex_s;
 	regex_t regex;
-	int rails; /* Rail size */
-	int recv_credits; /* bytes */
-	int rate_limits; /* bytes/sec */
 	int auto_start; /* default is 1, i.e., auto start producers */
 
 	/* Network Address & prefix_len from a given CIDR IP address string */
@@ -521,7 +517,6 @@ typedef struct ldmsd_row_group_s {
 
 typedef struct ldmsd_row_cache_s {
 	ldmsd_strgp_t strgp;
-	int group_key_count;
 	int row_limit;
 	struct rbt group_tree;	/* Tree of ldmsd_row_group_t */
 	pthread_mutex_t lock;
@@ -900,7 +895,6 @@ struct ldmsd_plugin {
 		LDMSD_PLUGIN_STORE
 	} type;
 	struct ldmsd_plugin_cfg *pi;
-	enum ldmsd_plugin_type (*get_type)(struct ldmsd_plugin *self);
 	int (*config)(struct ldmsd_plugin *self, struct attr_value_list *kwl, struct attr_value_list *avl);
 	void (*term)(struct ldmsd_plugin *self);
 	const char *(*usage)(struct ldmsd_plugin *self);
@@ -908,7 +902,6 @@ struct ldmsd_plugin {
 
 struct ldmsd_sampler {
 	struct ldmsd_plugin base;
-	ldms_set_t (*get_set)(struct ldmsd_sampler *self);
 	int (*sample)(struct ldmsd_sampler *self);
 };
 
@@ -1491,6 +1484,8 @@ typedef struct ldmsd_listen {
 	char *auth_name;
 	char *auth_dom_name;
 	struct attr_value_list *auth_attrs;
+	int credits;
+	int rx_limit;
 	ldms_t x;
 } *ldmsd_listen_t;
 
@@ -1506,10 +1501,15 @@ uint8_t ldmsd_is_initialized();
  * \param port   port
  * \param host   hostname
  * \param auth   authentication domain name
+ * \param credits    receive credits
+ * \param rx_limit   receive rate limit
+ *
+ * To use the default receive credits or receive rate limit, provide NULL.
  *
  * \return a listen cfgobj
  */
-ldmsd_listen_t ldmsd_listen_new(char *xprt, char *port, char *host, char *auth);
+ldmsd_listen_t ldmsd_listen_new(char *xprt, char *port, char *host, char *auth,
+											    char *credits, char *rx_limit);
 
 /**
  * LDMSD Authentication Domain Configuration Object

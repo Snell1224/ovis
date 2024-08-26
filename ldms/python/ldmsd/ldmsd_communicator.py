@@ -86,10 +86,9 @@ LDMSD_CTRL_CMD_MAP = {'usage': {'req_attr': [], 'opt_attr': ['name']},
                       ###############################
                       ##### Producer Policy #####
                       'prdcr_add': {'req_attr': ['name', 'type', 'xprt', 'host',
-                                                 'port'],
+                                                 'port', 'reconnect'],
                                     'opt_attr' : [ 'auth', 'perm', 'interval',
-                                                   'reconnect', 'rail',
-                                                   'credits', 'rx_rate' ] },
+                                                   'rail', 'credits', 'rx_rate' ] },
                       'prdcr_del': {'req_attr': ['name']},
                       'prdcr_start': {'req_attr': ['name'],
                                       'opt_attr': ['interval', 'reconnect']},
@@ -106,7 +105,7 @@ LDMSD_CTRL_CMD_MAP = {'usage': {'req_attr': [], 'opt_attr': ['name']},
                       'prdcr_stream_status' : {'req_attr':['regex'], 'opt_attr':[]},
                       ##### Bridge #####
                       'bridge_add': {'req_attr': ['name', 'xprt', 'host', 'port', 'reconnect'],
-                                    'opt_attr' : [ 'auth', 'perm', 'rail', 'credits', 'rx_rate' ] },
+                                     'opt_attr' : [ 'auth', 'perm', 'rail', 'credits', 'rx_rate' ] },
                       ##### Updater Policy #####
                       'updtr_add': {'req_attr': ['name'],
                                     'opt_attr': ['offset', 'push', 'interval', 'auto_interval', 'perm']},
@@ -156,7 +155,7 @@ LDMSD_CTRL_CMD_MAP = {'usage': {'req_attr': [], 'opt_attr': ['name']},
                       'prdcr_stats': {'req_attr':[], 'opt_attr': []},
                       'set_route' : {'req_attr':['instance'], 'opt_attr':[]},
                       'set_stats': {'req_attr':[], 'opt_attr': ['summary']},
-                      'listen': {'req_attr':['xprt', 'port'], 'opt_attr': ['host', 'auth']},
+                      'listen': {'req_attr':['xprt', 'port'], 'opt_attr': ['host', 'auth', 'credits', 'rx_rate']},
                       'metric_sets_default_authz': {'req_attr':[], 'opt_attr': ['uid', 'gid', 'perm']},
                       'set_sec_mod' : {'req_attr': ['regex'], 'opt_attr': ['uid', 'gid', 'perm']},
                       'log_status' : {'req_attr' : [], 'opt_attr' : ['name']},
@@ -206,13 +205,12 @@ LDMSD_CTRL_CMD_MAP = {'usage': {'req_attr': [], 'opt_attr': ['name']},
                                     'opt_attr': ['instance']
                             },
                       ##### Authetication. #####
-                      'auth_add': {'req_attr': ['name', 'xprt', 'host', 'port', 'reconnect'],
-                                   'opt_attr' : [ 'auth', 'perm', 'rail', 'credits', 'rx_rate' ] },
+                      'auth_add': {'req_attr': ['name'],
+                                   'opt_attr' : ['plugin', 'auth_opt'] },
                       ##### Sampler Discovery #####
-                      'advertiser_add': {'req_attr': ['name', 'xprt', 'host', 'port'],
-                                        'opt_attr' : [ 'auth', 'perm', 'interval',
-                                                   'reconnect', 'rail',
-                                                   'credits', 'rx_rate' ] },
+                      'advertiser_add': {'req_attr': ['name', 'xprt', 'host', 'port', 'reconnect'],
+                                        'opt_attr' : ['auth', 'perm', 'interval',
+                                                      'rail', 'credits', 'rx_rate' ] },
                       'advertiser_del': {'req_attr': ['name'], 'opt_attr': []},
                       'advertiser_start': {'req_attr': ['name'],
                                         'opt_attr' : ['xprt', 'host', 'port',
@@ -220,8 +218,8 @@ LDMSD_CTRL_CMD_MAP = {'usage': {'req_attr': [], 'opt_attr': ['name']},
                                                       'reconnect', 'rail',
                                                       'credits', 'rx_rate' ] },
                       'advertiser_stop': {'req_attr': ['name'], 'opt_attr': []},
-                      'prdcr_listen_add': {'req_attr': ['name'],
-                                           'opt_attr': ['rail', 'ip', 'credits', 'rx_rate', 'regex', 'disabled_start']},
+                      'prdcr_listen_add': {'req_attr': ['name', 'reconnect'],
+                                           'opt_attr': ['rail', 'ip', 'credits', 'rx_rate', 'regex', 'disable_start']},
                       'prdcr_listen_del': {'req_attr': ['name'], 'opt_attr': []},
                       'prdcr_listen_start': {'req_attr': ['name'], 'opt_attr': []},
                       'prdcr_listen_stop': {'req_attr': ['name'], 'opt_attr': []},
@@ -1486,7 +1484,7 @@ class Communicator(object):
         except Exception as e:
             return errno.ENOTCONN, str(e)
 
-    def listen(self, xprt, port, host=None, auth=None):
+    def listen(self, xprt, port, host=None, auth=None, credits=None, rx_limit=None):
         """
         Add a listening endpoint
 
@@ -1504,6 +1502,10 @@ class Communicator(object):
         ]
         if auth:
             attr_list.append(LDMSD_Req_Attr(attr_name='auth', value=auth))
+        if credits is not None:
+            attr_list.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.CREDITS, value=credits))
+        if rx_limit is not None:
+            attr_list.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.RX_RATE, value=rx_limit))
         req = LDMSD_Request(
                 command='listen',
                 attrs=attr_list
@@ -1520,7 +1522,7 @@ class Communicator(object):
         """
         attr_list = []
         if uid:
-            attr_list.append(LDMSD_Req_Attr(attr_id=LDMSDS_Req_Attr.UID, value=uid))
+            attr_list.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.UID, value=uid))
         if gid:
             attr_list.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.GID, value=gid))
         if perm:
@@ -2452,7 +2454,7 @@ class Communicator(object):
             return errno.ENOTCONN, str(e)
 
     def advertiser_add(self, name, xprt, host, port, reconnect, auth=None, perm=None,
-                                            rail=None, credits=None, rx_rate=None):
+                       rail=None, credits=None, rx_rate=None):
         """
         Add an advertiser. An advertiser sends an advertisement to an aggregator
         add it as a producer. Once started, the LDSMD will attempt to
@@ -2469,7 +2471,7 @@ class Communicator(object):
         - The reconnect interval in microseconds
 
         Keyword Parameters:
-        auth - The authentication demain
+        auth - The authentication domain of the remote daemon
         perm - The configuration client permission required to
                modify the producer configuration. Default is None.
         rail - The number of endpoints in a rail. The default is 1.
@@ -2488,7 +2490,7 @@ class Communicator(object):
                   'reconnect': reconnect, 'auth': auth, 'perm': perm,
                   'rail': rail, 'credits': credits, 'rx_rate': rx_rate}
         attrs = self._prdcr_add_attr_prep(**args_d)
-        attrs.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.TYPE, value="advertise"))
+        attrs.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.TYPE, value="advertiser"))
         req = LDMSD_Request( command_id = LDMSD_Request.ADVERTISER_ADD, attrs = attrs)
         try:
             req.send(self)
@@ -2499,8 +2501,8 @@ class Communicator(object):
             return errno.ENOTCONN, str(e)
 
     def advertiser_start(self, name, xprt=None, host=None, port=None,
-                              reconnect=None, auth=None, perm=None,
-                              rail=None, credits=None, rx_rate=None):
+                         reconnect=None, auth=None, perm=None,
+                         rail=None, credits=None, rx_rate=None):
         """
         Start an advertiser. If the advertiser does not exist, LDMSD will create it.
         In this case, the values of the required attributes in advertiser_add must be given.
@@ -2532,7 +2534,7 @@ class Communicator(object):
                   'reconnect': reconnect, 'auth': auth, 'perm': perm,
                   'rail': rail, 'credits': credits, 'rx_rate': rx_rate}
         attrs = self._prdcr_add_attr_prep(**args_d)
-        attrs.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.TYPE, value="advertise"))
+        attrs.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.TYPE, value="advertiser"))
         req = LDMSD_Request( command_id = LDMSD_Request.ADVERTISER_START, attrs = attrs)
         try:
             req.send(self)
@@ -2564,37 +2566,30 @@ class Communicator(object):
             self.close()
             return errno.ENOTCONN, str(e)
 
-    def prdcr_listen_add(self, name, disabled_start=None, regex=None, ip=None, rail=None, credits=None, rx_rate=None):
+    def prdcr_listen_add(self, name, reconnect, disable_start=None, regex=None, ip=None, rail=None, credits=None, rx_rate=None):
         """
         Tell an aggregator to wait for advertisements from samplers
 
-        The ggregator automatically adds and starts a producer when it receives
-        an advertisement that the peer (sampler) hostname matches the regular expression.
+        The aggregator automatically adds and starts a producer when it receives
+        an advertisement that the peer (sampler) hostname matches the regular expression
+        unless the disable_start parameter is specified.
 
         Parameters:
          - Name of the producer listen
          - Regular expression to match sampler hostnames
-         - The number of rail
-         - The credits in bytes
-         - The receive rate limit
+         - IP range in the CIDR format
 
         Return:
         - status is an errno from the errno module
         - data is an error message if status !=0 or None
         """
         attr_list = [ LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.NAME, value=name) ]
-        if disabled_start is not None:
-            attr_list.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.AUTO_INTERVAL, value=disabled_start))
+        if disable_start is not None:
+            attr_list.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.AUTO_INTERVAL, value=disable_start))
         if regex is not None:
             attr_list.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.REGEX, value=regex))
         if ip is not None:
             attr_list.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.IP, value=ip))
-        if rail is not None:
-            attr_list.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.RAIL, value=rail))
-        if credits is not None:
-            attr_list.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.CREDITS, value=credits))
-        if rx_rate is not None:
-            attr_list.append(LDMSD_Req_Attr(attr_id=LDMSD_Req_Attr.RX_RATE, value=rx_rate))
 
         req = LDMSD_Request(command_id=LDMSD_Request.PRDCR_LISTEN_ADD,
                             attrs=attr_list)

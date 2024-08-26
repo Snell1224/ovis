@@ -187,7 +187,6 @@ typedef struct decomp_static_col_cfg_s {
 	ldms_mval_t fill; /* fill value */
 	int fill_len; /* if fill is an array */
 	union ldms_value __fill; /* storing a non-array primitive fill value */
-	char *op_name;
 	enum ldmsd_decomp_op op;
 } *decomp_static_col_cfg_t;
 
@@ -292,14 +291,6 @@ decomp_static_release_decomp(ldmsd_strgp_t strgp)
 		decomp_static_cfg_free((void*)strgp->decomp);
 		strgp->decomp = NULL;
 	}
-}
-
-static int init_row_cache(ldmsd_strgp_t strgp, int row_limit)
-{
-	strgp->row_cache = ldmsd_row_cache_create(strgp, row_limit);
-	if (strgp->row_cache)
-		return 0;
-	return 1;
 }
 
 static int get_col_no(decomp_static_row_cfg_t cfg_row, const char *name)
@@ -517,8 +508,8 @@ static int handle_group(
 		}
 	}
 
-	rc = init_row_cache(strgp, cfg_row->row_limit);
-	if (rc)
+	strgp->row_cache = ldmsd_row_cache_create(strgp, cfg_row->row_limit);
+	if (!strgp->row_cache)
 		goto enomem;
 	return 0;
 enomem:
@@ -526,6 +517,39 @@ enomem:
 	THISLOG(reqc, ENOMEM, "%s: Insufficient memory.\n", strgp->obj.name);
 err_0:
 	return rc;
+}
+
+static enum ldmsd_decomp_op
+string_to_ldmsd_decomp_op(const char *operation)
+{
+        if (0 == strcmp(operation, "diff")) {
+                return LDMSD_DECOMP_OP_DIFF;
+        } else if (0 == strcmp(operation, "mean")) {
+                return LDMSD_DECOMP_OP_MEAN;
+        } else if (0 == strcmp(operation, "min")) {
+                return LDMSD_DECOMP_OP_MIN;
+        } else if (0 == strcmp(operation, "max")) {
+                return LDMSD_DECOMP_OP_MAX;
+        } else {
+                return LDMSD_DECOMP_OP_NONE;
+        }
+}
+
+static const char *
+ldmsd_decomp_op_to_string(enum ldmsd_decomp_op operation)
+{
+        switch (operation) {
+        case LDMSD_DECOMP_OP_DIFF:
+                return "diff";
+        case LDMSD_DECOMP_OP_MEAN:
+                return "mean";
+        case LDMSD_DECOMP_OP_MIN:
+                return "min";
+        case LDMSD_DECOMP_OP_MAX:
+                return "max";
+        default:
+                return "none";
+        }
 }
 
 static ldmsd_decomp_t
@@ -645,28 +669,14 @@ decomp_static_config(ldmsd_strgp_t strgp, json_t *jcfg,
 
 			jop = json_object_get(jcol, "op");
 			if (jop) {
-				if (0 == strcmp(json_string_value(jop), "diff")) {
-					cfg_col->op_name = strdup(json_string_value(jop));
-					cfg_col->op = LDMSD_DECOMP_OP_DIFF;
-					cfg_row->op_present = 1; /* true */
-				} else if (0 == strcmp(json_string_value(jop), "mean")) {
-					cfg_col->op_name = strdup(json_string_value(jop));
-					cfg_col->op = LDMSD_DECOMP_OP_MEAN;
-					cfg_row->op_present = 1; /* true */
-				} else if (0 == strcmp(json_string_value(jop), "min")) {
-					cfg_col->op_name = strdup(json_string_value(jop));
-					cfg_col->op = LDMSD_DECOMP_OP_MIN;
-					cfg_row->op_present = 1; /* true */
-				} else if (0 == strcmp(json_string_value(jop), "max")) {
-					cfg_col->op_name = strdup(json_string_value(jop));
-					cfg_col->op = LDMSD_DECOMP_OP_MAX;
-					cfg_row->op_present = 1; /* true */
-				} else {
+                                cfg_col->op = string_to_ldmsd_decomp_op(json_string_value(jop));
+                                if (cfg_col->op == LDMSD_DECOMP_OP_NONE) {
 					THISLOG(reqc, EINVAL, "strgp '%s': row '%d'--col %d : "
 						"unrecognized functional operator '%s'\n",
 						strgp->obj.name, row_no, col_no, json_string_value(jop));
 					goto err_0;
-				}
+                                }
+                                cfg_row->op_present = 1; /* true */
 			}
 			jfill = json_object_get(jcol, "fill");
 			if (jfill) {
@@ -1042,6 +1052,10 @@ static int diff_op(ldmsd_row_list_t row_list, ldmsd_row_t dest_row, int col_id)
 	ldmsd_row_t prev_row = TAILQ_NEXT(src_row, entry);
 	ldmsd_col_t dst_col = &dest_row->cols[col_id];
 	union ldms_value zero;
+        uint64_t src_time;
+        uint64_t prev_time;
+        uint64_t diff_time;
+
 	memset(&zero, 0, sizeof(zero));
 	/* dst_col->mval = src_row->cols[col_id].mval - prev_row->cols[col_id].mval; */
 	if (!prev_row) {
@@ -1100,10 +1114,11 @@ static int diff_op(ldmsd_row_list_t row_list, ldmsd_row_t dest_row, int col_id)
 			prev_row->cols[col_id].mval->v_d;
 		break;
 	case LDMS_V_TIMESTAMP:
-		dst_col->mval->v_ts.sec = src_row->cols[col_id].mval->v_ts.sec -
-			prev_row->cols[col_id].mval->v_ts.sec;
-		dst_col->mval->v_ts.usec = src_row->cols[col_id].mval->v_ts.usec -
-			prev_row->cols[col_id].mval->v_ts.usec;
+                src_time = (src_row->cols[col_id].mval->v_ts.sec * 1000000) + src_row->cols[col_id].mval->v_ts.usec;
+                prev_time = (prev_row->cols[col_id].mval->v_ts.sec * 1000000) + prev_row->cols[col_id].mval->v_ts.usec;
+                diff_time = src_time - prev_time;
+                dst_col->mval->v_ts.sec = (uint32_t)(diff_time / 1000000);
+                dst_col->mval->v_ts.usec = (uint32_t)(diff_time % 1000000);
 		break;
 	default:
 		return EINVAL;
@@ -1117,6 +1132,7 @@ static int mean_op(ldmsd_row_list_t row_list, ldmsd_row_t dest_row, int col_id)
 	ldmsd_row_t src_row = TAILQ_FIRST(row_list);
 	ldmsd_col_t dst_col = &dest_row->cols[col_id];
 	union ldms_value zero;
+        uint64_t sum_time;
 	memset(&zero, 0, sizeof(zero));
 
 	assign_value(dst_col->mval, &zero, dst_col->type, dst_col->array_len);
@@ -1154,8 +1170,10 @@ static int mean_op(ldmsd_row_list_t row_list, ldmsd_row_t dest_row, int col_id)
 			dst_col->mval->v_d += src_row->cols[col_id].mval->v_d;
 			break;
 		case LDMS_V_TIMESTAMP:
-			dst_col->mval->v_ts.sec += src_row->cols[col_id].mval->v_ts.sec;
-			dst_col->mval->v_ts.usec += src_row->cols[col_id].mval->v_ts.usec;
+                        sum_time = (dst_col->mval->v_ts.sec * 1000000) + dst_col->mval->v_ts.usec;
+                        sum_time += (src_row->cols[col_id].mval->v_ts.sec * 1000000) + src_row->cols[col_id].mval->v_ts.usec;
+                        dst_col->mval->v_ts.sec += (uint32_t)(sum_time / 1000000);
+                        dst_col->mval->v_ts.usec += (uint32_t)(sum_time % 1000000);
 			break;
 		default:
 			return EINVAL;
@@ -1195,8 +1213,10 @@ static int mean_op(ldmsd_row_list_t row_list, ldmsd_row_t dest_row, int col_id)
 		dst_col->mval->v_d /= count;
 		break;
 	case LDMS_V_TIMESTAMP:
-		dst_col->mval->v_ts.sec /= count;
-		dst_col->mval->v_ts.usec /= count;
+                sum_time = (dst_col->mval->v_ts.sec * 1000000) + dst_col->mval->v_ts.usec;
+                sum_time /= count;
+                dst_col->mval->v_ts.sec += (uint32_t)(sum_time / 1000000);
+                dst_col->mval->v_ts.usec += (uint32_t)(sum_time % 1000000);
 		break;
 	default:
 		return EINVAL;
@@ -1785,22 +1805,24 @@ static int decomp_static_decompose(ldmsd_strgp_t strgp, ldms_set_t set,
 			dup_row = row_cache_dup(cfg_row, mid_rbn, row);
 
 			/* Apply functional operators to columns */
+                        struct ldmsd_row_list_s tmp_row_list;
+                        int count;
+                        count = ldmsd_row_cache_make_list(&tmp_row_list,
+                                                          cfg_row->row_limit,
+                                                          strgp->row_cache,
+                                                          group_idx);
 			for (j = 0; j < row->col_count; j++) {
-				struct ldmsd_row_list_s row_list;
-				int count = ldmsd_row_cache_make_list(
-						&row_list,
-						cfg_row->row_limit,
-						strgp->row_cache,
-						group_idx);
-				if (count != cfg_row->group_count)
-					ovis_log(static_log, OVIS_LWARN,
-						"strgp '%s': insufficent rows in "
-						"cache to satisfy functional operator '%s' "
-						"on column '%s'.\n",
-						strgp->obj.name, cfg_col->op_name,
-						cfg_col->dst);
 				cfg_col = &cfg_row->cols[j];
-				rc = op_table[cfg_col->op](&row_list, dup_row, j);
+				if (cfg_col->op != LDMSD_DECOMP_OP_NONE
+                                    && count < cfg_row->row_limit)
+					ovis_log(static_log, OVIS_LDEBUG,
+                                                  "strgp '%s': insufficient rows (%d of %d) in "
+                                                  "cache to satisfy functional operator '%s' "
+                                                  "on column '%s'.\n",
+                                                  strgp->obj.name, count, cfg_row->row_limit,
+                                                  ldmsd_decomp_op_to_string(cfg_col->op),
+                                                  cfg_col->dst);
+				rc = op_table[cfg_col->op](&tmp_row_list, dup_row, j);
 			}
 			ldmsd_row_cache_idx_free(group_idx);
 			row = dup_row;

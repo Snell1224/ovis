@@ -103,6 +103,7 @@ static void __rail_priority_set(ldms_t _r, int prio);
 static void __rail_cred_get(ldms_t _r, ldms_cred_t lcl, ldms_cred_t rmt);
 static int __rail_update(ldms_t _r, struct ldms_set *set, ldms_update_cb_t cb, void *arg);
 static int __rail_get_threads(ldms_t _r, pthread_t *out, int n);
+static ldms_set_t __rail_set_by_name(ldms_t x, const char *set_name);
 
 zap_ep_t __rail_get_zap_ep(ldms_t x);
 
@@ -133,7 +134,10 @@ static struct ldms_xprt_ops_s __rail_ops = {
 	.get_zap_ep   = __rail_get_zap_ep,
 
 	.event_cb_set = __rail_event_cb_set,
+	.set_by_name  = __rail_set_by_name,
 };
+
+void __rail_cb(ldms_t x, ldms_xprt_event_t e, void *cb_arg);
 
 static int __rail_id_cmp(void *k, const void *tk)
 {
@@ -249,12 +253,6 @@ ldms_t ldms_xprt_rail_new(const char *xprt_name,
 	}
 	r->max_msg = zap_max_msg(zap);
 
-//	r->eps[0].ep = __ldms_xprt_new_with_auth(r->name, r->auth_name, r->auth_av_list);
-//	if (!r->eps[0].ep)
-//		goto err_1;
-//	ldms_xprt_ctxt_set(r->eps[0].ep, &r->eps[0], NULL);
-//	r->max_msg = r->eps[0].ep->max_msg;
-
 	/* The other endpoints will be created later in connect() or
 	 * __rail_zap_handle_conn_req() */
 
@@ -359,6 +357,58 @@ void __rail_ep_credit_return(struct ldms_rail_ep_s *rep, int credit)
 	zap_send(rep->ep->zap_ep, &req, len);
 }
 
+ldms_rail_t __rail_passive_legacy_wrap(ldms_t x, ldms_event_cb_t cb, void *cb_arg)
+{
+	assert(XTYPE_IS_LEGACY(x->xtype));
+	const char *xprt_name = ldms_xprt_type_name(x);
+	ldms_rail_t r;
+	union ldms_sockaddr self_addr, peer_addr;
+	socklen_t addr_len = sizeof(self_addr);
+	r = (ldms_rail_t)ldms_xprt_rail_new(xprt_name, 1,
+					    __RAIL_UNLIMITED, __RAIL_UNLIMITED,
+					    x->auth->plugin->name, NULL);
+	if (!r)
+		goto out;
+
+	x->event_cb = __rail_cb;
+	x->event_cb_arg = &r->eps[0];
+
+	zap_get_name(x->zap_ep, (void*)&self_addr, (void*)&peer_addr, &addr_len);
+
+	/* Replace rail_id w/ information from x */
+	r->rail_id.ip4_addr = peer_addr.sin.sin_addr.s_addr;
+	r->rail_id.pid= 0;
+	r->rail_id.rail_gn = (uint64_t)r;
+
+	r->event_cb = cb;
+	r->event_cb_arg = cb_arg;
+
+	r->xtype = LDMS_XTYPE_PASSIVE_RAIL;
+	r->state = LDMS_RAIL_EP_ACCEPTING;
+
+	rbn_init(&r->rbn, &r->rail_id);
+	pthread_mutex_lock(&__rail_mutex);
+	rbt_ins(&__passive_rail_rbt, &r->rbn);
+	ref_get(&r->ref, "__passive_rail_rbt");
+	pthread_mutex_unlock(&__rail_mutex);
+	r->connecting_eps = 1;
+
+	r->eps[0].ep = x;
+	r->eps[0].state = LDMS_RAIL_EP_ACCEPTING;
+	r->eps[0].send_credit = r->send_limit;
+	r->eps[0].rate_credit.credit = r->send_rate_limit;
+	r->eps[0].rate_credit.rate   = r->send_rate_limit;
+	r->eps[0].rate_credit.ts.tv_sec  = 0;
+	r->eps[0].rate_credit.ts.tv_nsec = 0;
+	r->eps[0].remote_is_rail = 0; /* remote is legacy */
+	ldms_xprt_ctxt_set(x, &r->eps[0], NULL);
+
+	ref_get(&r->ref, "ldms_accepting");
+
+ out:
+	return r;
+}
+
 /* rail interposer */
 void __rail_cb(ldms_t x, ldms_xprt_event_t e, void *cb_arg)
 {
@@ -371,21 +421,33 @@ void __rail_cb(ldms_t x, ldms_xprt_event_t e, void *cb_arg)
 
 	/*
 	 * NOTE: `x` is an xprt that could be:
-	 *   - legacy passive endpoint
+	 *   - legacy passive endpoint (e.g. old remote peer using 4.3.11)
+	 *   - ldms xprt member in a rail
 	 */
 
 	if (r->xtype == LDMS_XTYPE_PASSIVE_RAIL && r->state == LDMS_RAIL_EP_LISTENING) {
-		/* x is a legacy xprt accepted by a listening rail */
-		if (e->type == LDMS_XPRT_EVENT_CONNECTED) {
-			/* remove the rail interposer */
-			x->event_cb = r->event_cb;
-			x->event_cb_arg = r->event_cb_arg;
-			x->event_cb(x, e, x->event_cb_arg);
-		} else {
+		/*
+		 * This condition is only for `x` with legacy LDMS remote peer.
+		 * In this case, we shall wrap `x` with a new rail before
+		 * continuing.
+		 *
+		 * NOTE: If the remote is rail, it will use rail connect message
+		 * which is handled by `__rail_zap_handle_conn_req()`, which
+		 * bundles xprt members into the associated rail object.
+		 */
+		if (e->type != LDMS_XPRT_EVENT_CONNECTED) {
 			/* bad passive legacy xprt does not notify the app */
 			ldms_xprt_put(x);
+			return;
+
 		}
-		return;
+		/* Wrap it in new rail transport and continue */
+		r = __rail_passive_legacy_wrap(x, r->event_cb, r->event_cb_arg);
+		if (!r) {
+			ldms_xprt_put(x);
+			return;
+		}
+		rep = &r->eps[0];
 	}
 
 	ref_get(&r->ref, "rail_cb");
@@ -622,9 +684,6 @@ void __rail_zap_handle_conn_req(zap_ep_t zep, zap_event_t ev)
 			pthread_mutex_unlock(&__rail_mutex);
 			goto err_0;
 		}
-//		/* drop the unused first initial endpoint */
-//		ldms_xprt_put(r->eps[0].ep);
-//		r->eps[0].ep = NULL;
 
 		r->xtype = LDMS_XTYPE_PASSIVE_RAIL;
 		r->state = LDMS_RAIL_EP_ACCEPTING;
@@ -702,6 +761,7 @@ void __rail_zap_handle_conn_req(zap_ep_t zep, zap_event_t ev)
 	r->eps[m->idx].rate_credit.rate   = r->send_rate_limit;
 	r->eps[m->idx].rate_credit.ts.tv_sec  = 0;
 	r->eps[m->idx].rate_credit.ts.tv_nsec = 0;
+	r->eps[m->idx].remote_is_rail = 1;
 	ldms_xprt_ctxt_set(_x, &r->eps[m->idx], NULL);
 	pthread_mutex_unlock(&r->mutex);
 
@@ -1283,6 +1343,26 @@ int ldms_xprt_rail_eps(ldms_t _r)
 	return r->n_eps;
 }
 
+int64_t ldms_xprt_recv_limit(ldms_t _r)
+{
+	ldms_rail_t r = (void*)_r;
+	if (!_r)
+		return -EINVAL;
+	if (!XTYPE_IS_RAIL(_r->xtype))
+		return -EINVAL;
+	return r->recv_limit;
+}
+
+int64_t ldms_xprt_recv_rate_limit(ldms_t _r)
+{
+	ldms_rail_t r = (void*)_r;
+	if (!_r)
+		return -EINVAL;
+	if (!XTYPE_IS_RAIL(_r->xtype))
+		return -EINVAL;
+	return r->recv_rate_limit;
+}
+
 void __rail_ep_limit(ldms_t x, void *msg, int msg_len)
 {
 	/* x is the legacy ldms xprt in the rail, its context is the assocated
@@ -1478,4 +1558,120 @@ ldms_t __ldms_xprt_to_rail(ldms_t x)
 
 	struct ldms_rail_ep_s *ep = ldms_xprt_ctxt_get(x);
 	return ((ep)?(ldms_t)ep->rail:NULL);
+}
+
+static ldms_set_t __rail_set_by_name(ldms_t _x, const char *set_name)
+{
+	struct ldms_set *set;
+	struct rbn *rbn = NULL;
+	int i;
+	struct ldms_rail_s *r = (void*)_x;
+	struct ldms_xprt *x;
+
+	assert(XTYPE_IS_RAIL(r->xtype));
+
+	__ldms_set_tree_lock();
+	set = __ldms_find_local_set(set_name);
+	__ldms_set_tree_unlock();
+	if (!set)
+		return NULL;
+	for (i = 0; i < r->n_eps; i++) {
+		x = r->eps[i].ep;
+		pthread_mutex_lock(&x->lock);
+		rbn = rbt_find(&x->set_coll, set);
+		pthread_mutex_unlock(&x->lock);
+		if (rbn) {
+			/* found */
+			break;
+		}
+	}
+	if (!rbn) {
+		/* no set found in any of the xprt */
+		ref_put(&set->ref, "__ldms_find_local_set");
+		set = NULL;
+	}
+	return set;
+}
+
+/* defined in ldms_xprt.c */
+size_t format_set_delete_req(struct ldms_request *req, uint64_t xid,
+			     const char *inst_name);
+
+/* Called from ldms_xprt.c.
+ * Tell the peer that have an RBD for this set that it is being
+ * deleted. When they all reply, we can delete the set.
+ */
+void __rail_on_set_delete(ldms_t _r, struct ldms_set *s,
+			      ldms_set_delete_cb_t cb_fn)
+{
+	/*
+	 */
+	assert(XTYPE_IS_RAIL(_r->xtype));
+
+	ldms_rail_t r = (ldms_rail_t)_r;
+	struct ldms_request *req;
+	struct ldms_context *ctxt;
+	size_t len;
+	struct rbn *rbn;
+	struct xprt_set_coll_entry *ent;
+	int i;
+	ldms_t x;
+
+	x = NULL;
+
+	/* for each x in r */
+	for (i = 0; i < r->n_eps; i++) {
+		x = r->eps[i].ep;
+		pthread_mutex_lock(&x->lock);
+		rbn = rbt_find(&x->set_coll, s);
+		if (rbn)
+			goto found;
+		pthread_mutex_unlock(&x->lock);
+	}
+
+	/* No rbn found in any x in r. Just use the first x to notify with
+	 * ctxt->set_delete.lookup being 0. */
+	x = r->eps[0].ep;
+
+	/* let through */
+
+	pthread_mutex_lock(&x->lock);
+ found:
+	ctxt = __ldms_alloc_ctxt
+		(x,
+		 sizeof(struct ldms_request) + sizeof(struct ldms_context),
+		 LDMS_CONTEXT_SET_DELETE,
+		 s,
+		 cb_fn);
+	if (!ctxt) {
+		ovis_log(xlog, OVIS_LCRIT, "%s:%s:%d Memory allocation failure\n",
+				__FILE__, __func__, __LINE__);
+		pthread_mutex_unlock(&x->lock);
+		return;
+	}
+	if (rbn) {
+		/* We'll put set ref when we receive the reply. */
+		ctxt->set_delete.lookup = 1;
+		rbt_del(&x->set_coll, rbn);
+		ent = container_of(rbn, struct xprt_set_coll_entry, rbn);
+		free(ent);
+	} else {
+		/* We won't put ref on receiving reply. */
+		ctxt->set_delete.lookup = 0;
+	}
+	req = (struct ldms_request *)(ctxt + 1);
+	len = format_set_delete_req(req, (uint64_t)(unsigned long)ctxt,
+					ldms_set_instance_name_get(s));
+	zap_err_t zerr = zap_send(x->zap_ep, req, len);
+	if (zerr) {
+		char name[128];
+		(void) ldms_xprt_names(x, NULL, 0, NULL, 0, name, 128,
+					     NULL, 0, NI_NUMERICHOST);
+		ovis_log(xlog, OVIS_LERROR, "%s:%s:%d Error %d sending "
+				"the LDMS_SET_DELETE message to '%s'\n",
+				__FILE__, __func__, __LINE__, zerr, name);
+		x->zerrno = zerr;
+		__ldms_free_ctxt(x, ctxt);
+	}
+	pthread_mutex_unlock(&x->lock);
 }

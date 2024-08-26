@@ -177,8 +177,8 @@ const struct req_str_id attr_str_id_table[] = {
 	{  "container",         LDMSD_ATTR_CONTAINER  },
 	{  "credits",           LDMSD_ATTR_CREDITS  },
 	{  "decomposition",     LDMSD_ATTR_DECOMP  },
-	{  "disabled_start",    LDMSD_ATTR_AUTO_INTERVAL  },
-	{  "flush",		LDMSD_ATTR_INTERVAL },
+	{  "disable_start",     LDMSD_ATTR_AUTO_INTERVAL  },
+	{  "flush",             LDMSD_ATTR_INTERVAL },
 	{  "gid",               LDMSD_ATTR_GID  },
 	{  "host",              LDMSD_ATTR_HOST  },
 	{  "incr",              LDMSD_ATTR_INCREMENT  },
@@ -622,7 +622,9 @@ int __parse_xprt_endpoint(struct ldmsd_parse_ctxt *ctxt,
 	if ((0 == strncmp(name, "xprt", 4)) ||
 		(0 == strncmp(name, "port", 4)) ||
 		(0 == strncmp(name, "host", 4)) ||
-		(0 == strncmp(name, "auth", 4))) {
+		(0 == strncmp(name, "auth", 4)) ||
+		(0 == strncmp(name, "credits", 7)) ||
+		(0 == strncmp(name, "rx_rate", 8))) {
 		/* xprt, port, host, auth */
 		rc = add_attr_from_attr_str(name, value,
 					    &ctxt->request,
