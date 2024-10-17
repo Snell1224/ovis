@@ -20,7 +20,3 @@ sphinx:
 python:
   install:
     - requirements: rtd/requirements.txt
-
-commands:
-  - sphinx-apidoc -o rtd/source ovis  # Generate .rst files dynamically from the 'ovis' package
-  - sphinx-build -b html rtd/source rtd/build/html
