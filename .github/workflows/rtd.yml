@@ -1,0 +1,41 @@
+name: Build and Deploy ReadTheDocs
+
+on:
+  push:
+    branches:
+      - main
+      - "v*.*"   # Any version branch (e.g., v1.0, v2.1)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        
+      - name: Set up Python
+        uses: actions/setup-python@v3
+        with:
+          python-version: '3.x'  # Specify your preferred Python version
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r rtd/requirements.txt
+
+      - name: Generate .rst files
+        run: |
+          sphinx-apidoc -o rtd/source your_package  # Adjust path to your package
+      
+      - name: Build rtd
+        run: |
+          sphinx-build -b html rtd/source rtd/build/html
+
+      - name: Deploy to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: rtd/build/html
+          publish_branch: html-pages  # or your chosen rtd branch
+
