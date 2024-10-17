@@ -67,6 +67,7 @@
 #include "ldms.h"
 #include "ldms_xprt.h"
 #include "ldms_rail.h"
+#include "ldms_stream.h"
 
 #include "ldms_private.h"
 
@@ -138,6 +139,7 @@ static struct ldms_xprt_ops_s __rail_ops = {
 };
 
 void __rail_cb(ldms_t x, ldms_xprt_event_t e, void *cb_arg);
+int __rep_quota_release(struct ldms_rail_ep_s *rep, uint64_t q);
 
 static int __rail_id_cmp(void *k, const void *tk)
 {
@@ -190,7 +192,7 @@ int __str_rbn_cmp(void *tree_key, const void *key);
 zap_t __ldms_zap_get(const char *xprt);
 
 ldms_t ldms_xprt_rail_new(const char *xprt_name,
-			  int n, int64_t recv_limit, int64_t rate_limit,
+			  int n, int64_t recv_quota, int64_t rate_limit,
 			  const char *auth_name,
 			  struct attr_value_list *auth_av_list)
 {
@@ -223,7 +225,7 @@ ldms_t ldms_xprt_rail_new(const char *xprt_name,
 	sem_init(&r->sem, 0, 0);
 	r->xtype = LDMS_XTYPE_ACTIVE_RAIL; /* change to passive in listen() */
 	r->n_eps = n;
-	r->recv_limit = recv_limit;
+	r->recv_quota = recv_quota;
 	r->recv_rate_limit = rate_limit;
 	rbt_init(&r->stream_client_rbt, __str_rbn_cmp);
 	snprintf(r->name, sizeof(r->name), "%s", xprt_name);
@@ -238,13 +240,14 @@ ldms_t ldms_xprt_rail_new(const char *xprt_name,
 	for (i = 0; i < n; i++) {
 		r->eps[i].rail = r;
 		r->eps[i].idx = i;
-		r->eps[i].send_credit = __RAIL_UNLIMITED;
-		r->eps[i].rate_credit.credit = __RAIL_UNLIMITED;
-		r->eps[i].rate_credit.rate   = __RAIL_UNLIMITED;
-		r->eps[i].rate_credit.ts.tv_sec    = 0;
-		r->eps[i].rate_credit.ts.tv_nsec   = 0;
+		r->eps[i].send_quota = LDMS_UNLIMITED;
+		r->eps[i].rate_quota.quota = LDMS_UNLIMITED;
+		r->eps[i].rate_quota.rate   = LDMS_UNLIMITED;
+		r->eps[i].rate_quota.ts.tv_sec    = 0;
+		r->eps[i].rate_quota.ts.tv_nsec   = 0;
 		r->eps[i].remote_is_rail = -1;
 		rbt_init(&r->eps[i].sbuf_rbt, __stream_buf_cmp);
+		TAILQ_INIT(&r->eps[i].sbuf_tq);
 	}
 
 	zap = __ldms_zap_get(xprt_name);
@@ -274,7 +277,7 @@ ldms_t ldms_xprt_new_with_auth(const char *xprt_name,
 			       struct attr_value_list *auth_av_list)
 {
 	return ldms_xprt_rail_new(xprt_name, 1,
-			__RAIL_UNLIMITED, __RAIL_UNLIMITED,
+			LDMS_UNLIMITED, LDMS_UNLIMITED,
 			auth_name,  auth_av_list);
 }
 
@@ -340,19 +343,19 @@ int __rail_ev_prep(struct ldms_rail_s *r, ldms_xprt_event_t ev)
 /* implementation in ldms_stream.c */
 void __stream_on_rail_disconnected(struct ldms_rail_s *r);
 
-/* return send credit to peer */
-void __rail_ep_credit_return(struct ldms_rail_ep_s *rep, int credit)
+/* return send quota to peer */
+void __rail_ep_quota_return(struct ldms_rail_ep_s *rep, int quota)
 {
-	/* give back send credit */
+	/* give back send quota */
 	int len = sizeof(struct ldms_request_hdr) +
-		sizeof(struct ldms_send_credit_param);
+		sizeof(struct ldms_send_quota_param);
 	struct ldms_request req = {
 		.hdr = {
-			.cmd = htonl(LDMS_CMD_SEND_CREDIT),
+			.cmd = htonl(LDMS_CMD_SEND_QUOTA),
 			.len = htonl(len),
 		},
-		.send_credit = {
-			.send_credit = htonl(credit),
+		.send_quota = {
+			.send_quota = htonl(quota),
 		}};
 	zap_send(rep->ep->zap_ep, &req, len);
 }
@@ -365,7 +368,7 @@ ldms_rail_t __rail_passive_legacy_wrap(ldms_t x, ldms_event_cb_t cb, void *cb_ar
 	union ldms_sockaddr self_addr, peer_addr;
 	socklen_t addr_len = sizeof(self_addr);
 	r = (ldms_rail_t)ldms_xprt_rail_new(xprt_name, 1,
-					    __RAIL_UNLIMITED, __RAIL_UNLIMITED,
+					    LDMS_UNLIMITED, LDMS_UNLIMITED,
 					    x->auth->plugin->name, NULL);
 	if (!r)
 		goto out;
@@ -395,11 +398,11 @@ ldms_rail_t __rail_passive_legacy_wrap(ldms_t x, ldms_event_cb_t cb, void *cb_ar
 
 	r->eps[0].ep = x;
 	r->eps[0].state = LDMS_RAIL_EP_ACCEPTING;
-	r->eps[0].send_credit = r->send_limit;
-	r->eps[0].rate_credit.credit = r->send_rate_limit;
-	r->eps[0].rate_credit.rate   = r->send_rate_limit;
-	r->eps[0].rate_credit.ts.tv_sec  = 0;
-	r->eps[0].rate_credit.ts.tv_nsec = 0;
+	r->eps[0].send_quota = r->send_quota;
+	r->eps[0].rate_quota.quota = r->send_rate_limit;
+	r->eps[0].rate_quota.rate   = r->send_rate_limit;
+	r->eps[0].rate_quota.ts.tv_sec  = 0;
+	r->eps[0].rate_quota.ts.tv_nsec = 0;
 	r->eps[0].remote_is_rail = 0; /* remote is legacy */
 	ldms_xprt_ctxt_set(x, &r->eps[0], NULL);
 
@@ -550,7 +553,7 @@ void __rail_cb(ldms_t x, ldms_xprt_event_t e, void *cb_arg)
 	case LDMS_XPRT_EVENT_RECV:
 	case LDMS_XPRT_EVENT_SET_DELETE:
 	case LDMS_XPRT_EVENT_SEND_COMPLETE:
-	case LDMS_XPRT_EVENT_SEND_CREDIT_DEPOSITED:
+	case LDMS_XPRT_EVENT_SEND_QUOTA_DEPOSITED:
 		ev = *e;
 		call_cb = 1;
 		break;
@@ -570,12 +573,6 @@ void __rail_cb(ldms_t x, ldms_xprt_event_t e, void *cb_arg)
 		bzero(&r->rbn, sizeof(r->rbn));
 		pthread_mutex_unlock(&__rail_mutex);
 		ref_put(&r->ref, "__passive_rail_rbt");
-	}
-
-	if (e->type == LDMS_XPRT_EVENT_RECV && __rail_is_connected((void*)r)
-			&& r->recv_limit != __RAIL_UNLIMITED) {
-		/* give back send credit */
-		__rail_ep_credit_return(rep, e->data_len);
 	}
 
  out:
@@ -600,7 +597,7 @@ void __rail_conn_msg_ntoh(struct ldms_rail_conn_msg_s *m)
 	m->pid = ntohl(m->pid);
 	m->rail_gn = be64toh(m->rail_gn);
 	m->rate_limit = be64toh(m->rate_limit);
-	m->recv_limit = be64toh(m->recv_limit);
+	m->recv_quota = be64toh(m->recv_quota);
 }
 
 void __rail_zap_handle_conn_req(zap_ep_t zep, zap_event_t ev)
@@ -657,7 +654,7 @@ void __rail_zap_handle_conn_req(zap_ep_t zep, zap_event_t ev)
 		const char *xprt_name;
 		const char *auth_name;
 		struct attr_value_list *auth_av_list = NULL;
-		int64_t recv_limit;
+		int64_t recv_quota;
 		int64_t rate_limit;
 		ldms_event_cb_t cb;
 		void *cb_arg;
@@ -665,20 +662,20 @@ void __rail_zap_handle_conn_req(zap_ep_t zep, zap_event_t ev)
 			xprt_name = lr->name;
 			auth_name = lr->auth_name;
 			auth_av_list = lr->auth_av_list;
-			recv_limit = lr->recv_limit;
+			recv_quota = lr->recv_quota;
 			rate_limit = lr->recv_rate_limit;
 			cb = lr->event_cb;
 			cb_arg = lr->event_cb_arg;
 		} else {
 			xprt_name = lx->name;
 			auth_name = lx->auth?lx->auth->plugin->name:NULL;
-			recv_limit = __RAIL_UNLIMITED;
-			rate_limit = __RAIL_UNLIMITED;
+			recv_quota = LDMS_UNLIMITED;
+			rate_limit = LDMS_UNLIMITED;
 			cb = lx->event_cb;
 			cb_arg = lx->event_cb_arg;
 		}
 		r = (void*)ldms_xprt_rail_new(xprt_name, m->n_eps,
-				recv_limit, rate_limit, auth_name, auth_av_list);
+				recv_quota, rate_limit, auth_name, auth_av_list);
 		if (!r) {
 			snprintf(rej_msg, sizeof(rej_msg), "passive rail create error: %d", errno);
 			pthread_mutex_unlock(&__rail_mutex);
@@ -687,7 +684,7 @@ void __rail_zap_handle_conn_req(zap_ep_t zep, zap_event_t ev)
 
 		r->xtype = LDMS_XTYPE_PASSIVE_RAIL;
 		r->state = LDMS_RAIL_EP_ACCEPTING;
-		r->send_limit = m->recv_limit;
+		r->send_quota = m->recv_quota;
 		r->send_rate_limit = m->rate_limit;
 		r->event_cb = cb;
 		r->event_cb_arg = cb_arg;
@@ -756,11 +753,11 @@ void __rail_zap_handle_conn_req(zap_ep_t zep, zap_event_t ev)
 	_x->event_cb_arg = &r->eps[m->idx];
 	r->eps[m->idx].ep = _x;
 	r->eps[m->idx].state = LDMS_RAIL_EP_ACCEPTING;
-	r->eps[m->idx].send_credit = r->send_limit;
-	r->eps[m->idx].rate_credit.credit = r->send_rate_limit;
-	r->eps[m->idx].rate_credit.rate   = r->send_rate_limit;
-	r->eps[m->idx].rate_credit.ts.tv_sec  = 0;
-	r->eps[m->idx].rate_credit.ts.tv_nsec = 0;
+	r->eps[m->idx].send_quota = r->send_quota;
+	r->eps[m->idx].rate_quota.quota = r->send_rate_limit;
+	r->eps[m->idx].rate_quota.rate   = r->send_rate_limit;
+	r->eps[m->idx].rate_quota.ts.tv_sec  = 0;
+	r->eps[m->idx].rate_quota.ts.tv_nsec = 0;
 	r->eps[m->idx].remote_is_rail = 1;
 	ldms_xprt_ctxt_set(_x, &r->eps[m->idx], NULL);
 	pthread_mutex_unlock(&r->mutex);
@@ -814,7 +811,7 @@ static void __ldms_rail_conn_msg_init(struct ldms_rail_s *r, int idx, struct ldm
 	__ldms_xprt_conn_msg_init(r->eps[idx].ep, (void*)m);
 	m->conn_type = htonl(LDMS_CONN_TYPE_RAIL);
 	m->rate_limit = htobe64(r->recv_rate_limit);
-	m->recv_limit = htobe64(r->recv_limit);
+	m->recv_quota = htobe64(r->recv_quota);
 	m->n_eps = htonl(r->n_eps);
 	m->idx = htonl(idx);
 	m->pid = htonl(getpid());
@@ -965,58 +962,58 @@ static void __rail_close(ldms_t _r)
 
 /*
  * \retval 0      if success
- * \retval ENOBUFS if not enough credit
+ * \retval ENOBUFS if not enough quota
  */
-int __credit_acquire(uint64_t *credit, uint64_t n)
+int __quota_acquire(uint64_t *quota, uint64_t n)
 {
 	uint64_t v0, v1;
 
-	__atomic_load(credit, &v0, __ATOMIC_SEQ_CST);
-	if (v0 == __RAIL_UNLIMITED)
+	__atomic_load(quota, &v0, __ATOMIC_SEQ_CST);
+	if (v0 == LDMS_UNLIMITED)
 		return 0;
  again:
 	if (v0 < n)
 		return ENOBUFS;
 	v1 = v0 - n;
-	if (__atomic_compare_exchange(credit, &v0, &v1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+	if (__atomic_compare_exchange(quota, &v0, &v1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
 		return 0;
-	/* The other thread won the credit modification race; try again. */
+	/* The other thread won the quota modification race; try again. */
 	goto again;
 }
 
 /*
- * Release `n` credits, and returns the new credit value.
+ * Release `n` quotas, and returns the new quota value.
  */
-uint64_t __credit_release(uint64_t *credit, uint64_t n)
+uint64_t __quota_release(uint64_t *quota, uint64_t n)
 {
 	uint64_t v0;
 
-	__atomic_load(credit, &v0, __ATOMIC_SEQ_CST);
-	if (v0 == __RAIL_UNLIMITED)
+	__atomic_load(quota, &v0, __ATOMIC_SEQ_CST);
+	if (v0 == LDMS_UNLIMITED)
 		return v0;
-	return __atomic_add_fetch(credit, n, __ATOMIC_SEQ_CST);
+	return __atomic_add_fetch(quota, n, __ATOMIC_SEQ_CST);
 }
 
-int __rate_credit_acquire(struct ldms_rail_rate_credit_s *c, uint64_t n)
+int __rate_quota_acquire(struct ldms_rail_rate_quota_s *c, uint64_t n)
 {
 	int rc;
 	time_t tv_sec;
 	struct timespec ts;
 	uint64_t v0, v1;
 
-	if (c->rate == __RAIL_UNLIMITED)
+	if (c->rate == LDMS_UNLIMITED)
 		return 0;
 
  again:
 	__atomic_load(&c->ts.tv_sec, &tv_sec, __ATOMIC_SEQ_CST);
-	__atomic_load(&c->credit, &v0, __ATOMIC_SEQ_CST);
+	__atomic_load(&c->quota, &v0, __ATOMIC_SEQ_CST);
 	rc = clock_gettime(CLOCK_REALTIME, &ts);
 	if (rc)
 		return errno;
 	if (tv_sec < ts.tv_sec) {
-		/* the second has changed, reset credit */
+		/* the second has changed, reset quota */
 		if (0 == __atomic_compare_exchange(
-				&c->credit, &v0, &c->rate,
+				&c->quota, &v0, &c->rate,
 				0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
 			goto again;
 		/* update ts */
@@ -1024,7 +1021,7 @@ int __rate_credit_acquire(struct ldms_rail_rate_credit_s *c, uint64_t n)
 				&c->ts.tv_sec, &tv_sec, &ts.tv_sec,
 				0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
 			goto again;
-		/* credit reset; proceed */
+		/* quota reset; proceed */
 		v0 = c->rate;
 	}
 
@@ -1032,18 +1029,18 @@ int __rate_credit_acquire(struct ldms_rail_rate_credit_s *c, uint64_t n)
 		return ENOBUFS;
 	v1 = v0 - n;
 	if (0 == __atomic_compare_exchange(
-			&c->credit, &v0, &v1,
+			&c->quota, &v0, &v1,
 			0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
-		/* The other thread won the credit modification race; try again. */
+		/* The other thread won the quota modification race; try again. */
 		goto again;
 	return 0;
 }
 
-void __rate_credit_release(struct ldms_rail_rate_credit_s *c, uint64_t n)
+void __rate_quota_release(struct ldms_rail_rate_quota_s *c, uint64_t n)
 {
 	int rc;
 	struct timespec ts;
-	if (c->rate == __RAIL_UNLIMITED)
+	if (c->rate == LDMS_UNLIMITED)
 		return;
 	rc = clock_gettime(CLOCK_REALTIME, &ts);
 	if (rc)
@@ -1051,7 +1048,7 @@ void __rate_credit_release(struct ldms_rail_rate_credit_s *c, uint64_t n)
 	if (0 == __atomic_compare_exchange( &c->ts.tv_sec, &ts.tv_sec, &ts.tv_sec,
 				0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
 		return; /* tv_sec changed, no need to return */
-	__atomic_fetch_add(&c->credit, n, __ATOMIC_SEQ_CST);
+	__atomic_fetch_add(&c->quota, n, __ATOMIC_SEQ_CST);
 }
 
 int ldms_xprt_connected(struct ldms_xprt *x);
@@ -1081,18 +1078,10 @@ static int __rail_send(ldms_t _r, char *msg_buf, size_t msg_len)
 		goto out;
 	}
 	rep = &r->eps[0];
-	rc = __credit_acquire(&rep->send_credit, msg_len);
-	if (rc)
-		goto out;
-	rc = __rate_credit_acquire(&rep->rate_credit, msg_len);
-	if (rc) {
-		__credit_release(&rep->send_credit, msg_len);
-		goto out;
-	}
 	rc = ldms_xprt_send(rep->ep, msg_buf, msg_len);
 	if (rc) {
-		/* release the acquired credit if send failed */
-		__credit_release(&rep->send_credit, msg_len);
+		/* release the acquired quota if send failed */
+		__rep_quota_release(rep, msg_len);
 	}
  out:
 	pthread_mutex_unlock(&r->mutex);
@@ -1102,7 +1091,8 @@ static int __rail_send(ldms_t _r, char *msg_buf, size_t msg_len)
 static size_t __rail_msg_max(ldms_t _r)
 {
 	ldms_rail_t r = (ldms_rail_t)_r;
-	return r->max_msg;
+	return	r->max_msg - (sizeof(struct ldms_request_hdr) +
+			sizeof(struct ldms_send_cmd_param));
 }
 
 /* interposer */
@@ -1271,9 +1261,9 @@ struct ldms_rail_update_ctxt_s {
 
 void __rail_update_cb(ldms_t x, ldms_set_t s, int flags, void *arg)
 {
-	ldms_rail_t r = ldms_xprt_ctxt_get(x);
+	struct ldms_rail_ep_s *rep = ldms_xprt_ctxt_get(x);
 	ldms_rail_update_ctxt_t uc = arg;
-	uc->app_cb((ldms_t)r, s, flags, uc->cb_arg);
+	uc->app_cb((ldms_t)rep->rail, s, flags, uc->cb_arg);
 	if (!(flags & LDMS_UPD_F_MORE)) {
 		free(uc);
 	}
@@ -1292,7 +1282,7 @@ static int __rail_update(ldms_t _r, struct ldms_set *set,
 	uc->r = r;
 	uc->app_cb = cb;
 	uc->cb_arg = arg;
-	rc = ldms_xprt_update(set, __rail_update_cb, uc);
+	rc = set->xprt->ops.update(set->xprt, set, __rail_update_cb, uc);
 	if (rc) {
 		/* synchronously error, clean up the context */
 		free(uc);
@@ -1343,17 +1333,17 @@ int ldms_xprt_rail_eps(ldms_t _r)
 	return r->n_eps;
 }
 
-int64_t ldms_xprt_recv_limit(ldms_t _r)
+int64_t ldms_xprt_rail_recv_quota_get(ldms_t _r)
 {
 	ldms_rail_t r = (void*)_r;
 	if (!_r)
 		return -EINVAL;
 	if (!XTYPE_IS_RAIL(_r->xtype))
 		return -EINVAL;
-	return r->recv_limit;
+	return r->recv_quota;
 }
 
-int64_t ldms_xprt_recv_rate_limit(ldms_t _r)
+int64_t ldms_xprt_rail_recv_rate_limit_get(ldms_t _r)
 {
 	ldms_rail_t r = (void*)_r;
 	if (!_r)
@@ -1361,6 +1351,16 @@ int64_t ldms_xprt_recv_rate_limit(ldms_t _r)
 	if (!XTYPE_IS_RAIL(_r->xtype))
 		return -EINVAL;
 	return r->recv_rate_limit;
+}
+
+int64_t ldms_xprt_rail_send_rate_limit_get(ldms_t _r)
+{
+	ldms_rail_t r = (void*)_r;
+	if (!_r)
+		return -EINVAL;
+	if (!XTYPE_IS_RAIL(_r->xtype))
+		return -EINVAL;
+	return r->send_rate_limit;
 }
 
 void __rail_ep_limit(ldms_t x, void *msg, int msg_len)
@@ -1375,35 +1375,36 @@ void __rail_ep_limit(ldms_t x, void *msg, int msg_len)
 	if (conn_msg->conn_type != htonl(LDMS_CONN_TYPE_RAIL))
 		goto unlimited;
 	/* This does not race; during end point setup */
-	rep->rail->send_limit = be64toh(conn_msg->recv_limit);
+	rep->rail->send_quota = be64toh(conn_msg->recv_quota);
 	rep->rail->send_rate_limit = be64toh(conn_msg->rate_limit);
 
-	rep->send_credit = be64toh(conn_msg->recv_limit);
-	rep->rate_credit.credit = be64toh(conn_msg->rate_limit);
-	rep->rate_credit.rate   = be64toh(conn_msg->rate_limit);
-	rep->rate_credit.ts.tv_sec  = 0;
-	rep->rate_credit.ts.tv_nsec = 0;
+	rep->send_quota = be64toh(conn_msg->recv_quota);
+	rep->rate_quota.quota = be64toh(conn_msg->rate_limit);
+	rep->rate_quota.rate   = be64toh(conn_msg->rate_limit);
+	rep->rate_quota.ts.tv_sec  = 0;
+	rep->rate_quota.ts.tv_nsec = 0;
 	rep->remote_is_rail = 1;
 	return;
  unlimited:
-	rep->send_credit = __RAIL_UNLIMITED;
-	rep->rate_credit.credit = __RAIL_UNLIMITED;
-	rep->rate_credit.rate   = __RAIL_UNLIMITED;
+	rep->send_quota = LDMS_UNLIMITED;
+	rep->rate_quota.quota = LDMS_UNLIMITED;
+	rep->rate_quota.rate   = LDMS_UNLIMITED;
 	rep->remote_is_rail = 0;
 }
 
-void __rail_process_send_credit(ldms_t x, struct ldms_request *req)
+void __rail_process_send_quota(ldms_t x, struct ldms_request *req)
 {
-	uint32_t sc = ntohl(req->send_credit.send_credit);
+	uint32_t sc = ntohl(req->send_quota.send_quota);
 	struct ldms_rail_ep_s *rep = ldms_xprt_ctxt_get(x);
 	struct ldms_xprt_event ev = {0};
-	ev.credit.credit = __credit_release(&rep->send_credit, sc);
-	ev.credit.ep_idx = rep->idx;
-	ev.type = LDMS_XPRT_EVENT_SEND_CREDIT_DEPOSITED;
+	ev.quota.quota = __rep_quota_release(rep, sc);
+	ev.quota.ep_idx = rep->idx;
+	ev.type = LDMS_XPRT_EVENT_SEND_QUOTA_DEPOSITED;
 	rep->rail->event_cb((ldms_t)rep->rail, &ev, rep->rail->event_cb_arg);
+	__rep_flush_sbuf_tq(rep);
 }
 
-int ldms_xprt_rail_send_credit_get(ldms_t _r, uint64_t *credits, int n)
+int ldms_xprt_rail_send_quota_get(ldms_t _r, uint64_t *quotas, int n)
 {
 	ldms_rail_t r;
 	int i;
@@ -1415,7 +1416,41 @@ int ldms_xprt_rail_send_credit_get(ldms_t _r, uint64_t *credits, int n)
 	if (n < r->n_eps)
 		return -ENOMEM;
 	for (i = 0; i < r->n_eps; i++) {
-		credits[i] = r->eps[i].send_credit;
+		quotas[i] = r->eps[i].send_quota;
+	}
+	return 0;
+}
+
+int ldms_xprt_rail_pending_ret_quota_get(ldms_t _r, uint64_t *out, int n)
+{
+	ldms_rail_t r;
+	int i;
+	if (!_r)
+		return -EINVAL;
+	if (!XTYPE_IS_RAIL(_r->xtype))
+		return -EINVAL;
+	r = (void*)_r;
+	if (n < r->n_eps)
+		return -ENOMEM;
+	for (i = 0; i < r->n_eps; i++) {
+		out[i] = r->eps[i].pending_ret_quota;
+	}
+	return 0;
+}
+
+int ldms_xprt_rail_in_eps_stq_get(ldms_t _r, uint64_t *out, int n)
+{
+	ldms_rail_t r;
+	int i;
+	if (!_r)
+		return -EINVAL;
+	if (!XTYPE_IS_RAIL(_r->xtype))
+		return -EINVAL;
+	r = (void*)_r;
+	if (n < r->n_eps)
+		return -ENOMEM;
+	for (i = 0; i < r->n_eps; i++) {
+		out[i] = r->eps[i].in_eps_stq;
 	}
 	return 0;
 }
@@ -1674,4 +1709,181 @@ void __rail_on_set_delete(ldms_t _r, struct ldms_set *s,
 		__ldms_free_ctxt(x, ctxt);
 	}
 	pthread_mutex_unlock(&x->lock);
+}
+
+int __rep_flush_sbuf_tq(struct ldms_rail_ep_s *rep)
+{
+	int rc;
+	struct __pending_sbuf_s *p;
+	while ((p = TAILQ_FIRST(&rep->sbuf_tq))) {
+		rc = __rep_quota_acquire(rep, p->sbuf->msg->msg_len);
+		if (rc)
+			goto out;
+		rc = __rep_publish(rep, p->sbuf->name,
+				p->sbuf->msg->name_hash,
+				p->sbuf->msg->stream_type,
+			     &p->sbuf->msg->src, p->sbuf->msg->msg_gn,
+			     &p->sbuf->msg->cred, p->sbuf->msg->perm,
+			     p->sbuf->data,
+			     p->sbuf->data_len);
+		if (rc) {
+			__rep_quota_release(rep, p->sbuf->msg->msg_len);
+			goto out;
+		}
+		TAILQ_REMOVE(&rep->sbuf_tq, p, entry);
+		ref_put(&p->sbuf->ref, "pending");
+		free(p);
+	}
+	rc = 0;
+ out:
+	return rc;
+}
+
+int __rep_quota_acquire(struct ldms_rail_ep_s *rep, uint64_t q)
+{
+	int rc;
+	rc = __quota_acquire(&rep->send_quota, q);
+	if (rc)
+		return rc;
+	rc = __rate_quota_acquire(&rep->rate_quota, q);
+	if (rc) {
+		__rep_quota_release(rep, q);
+		return rc;
+	}
+	return 0;
+}
+
+int __rep_quota_release(struct ldms_rail_ep_s *rep, uint64_t q)
+{
+	uint64_t v0, v1, vx;
+	/* take care of your debt first */
+ again:
+	__atomic_load(&rep->send_quota_debt, &v0, __ATOMIC_SEQ_CST);
+	if (!v0)
+		goto release;
+	if (v0 <= q) {
+		vx = v0;
+		v1 = 0;
+		if (!__atomic_compare_exchange(&rep->send_quota_debt, &vx, &v1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+			goto again;
+		q -= v0;
+	} else {
+		vx = v0;
+		v1 = v0 - q;
+		if (!__atomic_compare_exchange(&rep->send_quota_debt, &vx, &v1, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST))
+			goto again;
+		q = 0;
+	}
+ release:
+	/* then release what you have left */
+	return __quota_release(&rep->send_quota, q);
+}
+
+int ldms_xprt_rail_recv_quota_set(ldms_t x, uint64_t q)
+{
+	ldms_rail_t r;
+	struct ldms_rail_ep_s *rep;
+	int len;
+	zap_err_t zerr;
+
+	if (!LDMS_IS_RAIL(x))
+		return -EINVAL;
+
+	r = (void*)x;
+
+	if (q == r->recv_quota)
+		return 0; /* no need to continue */
+
+	r->recv_quota = q;
+
+	rep = &r->eps[0];
+
+	len = sizeof(struct ldms_request_hdr) +
+		sizeof(struct ldms_quota_reconfig_param);
+	struct ldms_request req = {
+		.hdr = {
+			.cmd = htonl(LDMS_CMD_QUOTA_RECONFIG),
+			.len = htonl(len),
+		},
+		.quota_reconfig = {
+			.q = htobe64(q),
+		}};
+	zerr = zap_send(rep->ep->zap_ep, &req, len);
+	return -zap_zerr2errno(zerr);
+}
+
+void __rail_process_quota_reconfig(ldms_t x, struct ldms_request *req)
+{
+	int64_t add;
+	int i, rc;
+	uint64_t q = be64toh(req->quota_reconfig.q);
+	struct ldms_rail_ep_s *rep = ldms_xprt_ctxt_get(x);
+	ldms_rail_t r = rep->rail;
+	add = q - r->send_quota;
+	r->send_quota = q;
+	if (!add)
+		return; /* value not changing, nothing else to do */
+	for (i = 0; i < r->n_eps; i++) {
+		rep = &r->eps[i];
+		if (add > 0) {
+			__rep_quota_release(rep, add);
+		} else {
+			rc = __quota_acquire(&rep->send_quota, -add);
+			if (rc) {
+				/* not enough quota to take, now we're in debt */
+				__atomic_add_fetch(&rep->send_quota_debt, -add, __ATOMIC_SEQ_CST);
+			}
+		}
+	}
+}
+
+int ldms_xprt_rail_recv_rate_limit_set(ldms_t x, uint64_t rate)
+{
+	ldms_rail_t r;
+	struct ldms_rail_ep_s *rep;
+	int len;
+	zap_err_t zerr;
+
+	if (!LDMS_IS_RAIL(x))
+		return -EINVAL;
+
+	r = (void*)x;
+
+	if (rate == r->recv_rate_limit)
+		return 0; /* no need to continue */
+
+	r->recv_rate_limit = rate;
+
+	rep = &r->eps[0];
+
+	len = sizeof(struct ldms_request_hdr) +
+		sizeof(struct ldms_quota_reconfig_param);
+	struct ldms_request req = {
+		.hdr = {
+			.cmd = htonl(LDMS_CMD_RATE_RECONFIG),
+			.len = htonl(len),
+		},
+		.rate_reconfig = {
+			.rate = htobe64(rate),
+		}};
+	zerr = zap_send(rep->ep->zap_ep, &req, len);
+	return -zap_zerr2errno(zerr);
+}
+
+void __rail_process_rate_reconfig(ldms_t x, struct ldms_request *req)
+{
+	int i;
+	uint64_t rate = be64toh(req->rate_reconfig.rate);
+	struct ldms_rail_ep_s *rep = ldms_xprt_ctxt_get(x);
+	ldms_rail_t r = rep->rail;
+
+	if (r->send_rate_limit == rate)
+		return;
+	r->send_rate_limit = rate;
+	/* We can just update the rate as the rate_quota will be reset in the
+	 * next second anyway. */
+	for (i = 0; i < r->n_eps; i++) {
+		rep = &r->eps[i];
+		rep->rate_quota.rate = rate;
+	}
 }

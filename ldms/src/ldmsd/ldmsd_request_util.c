@@ -61,7 +61,7 @@ struct req_str_id {
 	uint32_t id;
 };
 
-const struct req_str_id req_str_id_table[] = {
+struct req_str_id req_str_id_table[] = {
 	/* This table need to be sorted by keyword for bsearch() */
 	{  "advertiser_add",      LDMSD_ADVERTISER_ADD_REQ  },
 	{  "advertiser_del",      LDMSD_ADVERTISER_DEL_REQ  },
@@ -80,7 +80,7 @@ const struct req_str_id req_str_id_table[] = {
 	{  "daemon_name",        LDMSD_DAEMON_NAME_SET_REQ  },
 	{  "daemon_status",      LDMSD_DAEMON_STATUS_REQ  },
 	{  "default_auth",       LDMSD_DEFAULT_AUTH_REQ  },
-	{  "default_credits",    LDMSD_DEFAULT_CREDITS_REQ  },
+	{  "default_quota",      LDMSD_DEFAULT_QUOTA_REQ  },
 	{  "dump_cfg",           LDMSD_DUMP_CFG_REQ },
 	{  "env",                LDMSD_ENV_REQ  },
 	{  "exit",               LDMSD_EXIT_DAEMON_REQ  },
@@ -124,6 +124,12 @@ const struct req_str_id req_str_id_table[] = {
 	{  "prdcr_subscribe",    LDMSD_PRDCR_SUBSCRIBE_REQ },
 	{  "prdcr_unsubscribe",  LDMSD_PRDCR_UNSUBSCRIBE_REQ },
 	{  "publish_kernel",     LDMSD_PUBLISH_KERNEL_REQ  },
+	{  "qgroup_config",      LDMSD_QGROUP_CONFIG_REQ },
+	{  "qgroup_info",        LDMSD_QGROUP_INFO_REQ },
+	{  "qgroup_member_add",  LDMSD_QGROUP_MEMBER_ADD_REQ  },
+	{  "qgroup_member_del",  LDMSD_QGROUP_MEMBER_DEL_REQ },
+	{  "qgroup_start",       LDMSD_QGROUP_START_REQ },
+	{  "qgroup_stop",        LDMSD_QGROUP_STOP_REQ },
 	{  "set_memory",         LDMSD_MEMORY_REQ },
 	{  "set_route",          LDMSD_SET_ROUTE_REQ  },
 	{  "set_sec_mod",        LDMSD_SET_SEC_MOD_REQ  },
@@ -169,13 +175,15 @@ const struct req_str_id req_str_id_table[] = {
 };
 
 /* This table need to be sorted by keyword for bsearch() */
-const struct req_str_id attr_str_id_table[] = {
+struct req_str_id attr_str_id_table[] = {
+	{  "ask_amount",        LDMSD_ATTR_ASK_AMOUNT },
+	{  "ask_interval",      LDMSD_ATTR_ASK_INTERVAL },
+	{  "ask_mark",          LDMSD_ATTR_ASK_MARK },
 	{  "auth",              LDMSD_ATTR_AUTH  },
 	{  "auto_interval",     LDMSD_ATTR_AUTO_INTERVAL  },
 	{  "auto_switch",       LDMSD_ATTR_AUTO_SWITCH  },
 	{  "base",              LDMSD_ATTR_BASE  },
 	{  "container",         LDMSD_ATTR_CONTAINER  },
-	{  "credits",           LDMSD_ATTR_CREDITS  },
 	{  "decomposition",     LDMSD_ATTR_DECOMP  },
 	{  "disable_start",     LDMSD_ATTR_AUTO_INTERVAL  },
 	{  "flush",             LDMSD_ATTR_INTERVAL },
@@ -200,10 +208,12 @@ const struct req_str_id attr_str_id_table[] = {
 	{  "port",              LDMSD_ATTR_PORT  },
 	{  "producer",          LDMSD_ATTR_PRODUCER  },
 	{  "push",              LDMSD_ATTR_PUSH  },
+	{  "quota",             LDMSD_ATTR_QUOTA  },
 	{  "rail",              LDMSD_ATTR_RAIL  },
 	{  "reconnect",         LDMSD_ATTR_INTERVAL  },
 	{  "regex",             LDMSD_ATTR_REGEX  },
 	{  "reset",             LDMSD_ATTR_RESET  },
+	{  "reset_interval",    LDMSD_ATTR_RESET_INTERVAL },
 	{  "rx_rate",           LDMSD_ATTR_RX_RATE  },
 	{  "schema",            LDMSD_ATTR_SCHEMA  },
 	{  "size",              LDMSD_ATTR_SIZE  },
@@ -623,7 +633,7 @@ int __parse_xprt_endpoint(struct ldmsd_parse_ctxt *ctxt,
 		(0 == strncmp(name, "port", 4)) ||
 		(0 == strncmp(name, "host", 4)) ||
 		(0 == strncmp(name, "auth", 4)) ||
-		(0 == strncmp(name, "credits", 7)) ||
+		(0 == strncmp(name, "quota", 5)) ||
 		(0 == strncmp(name, "rx_rate", 8))) {
 		/* xprt, port, host, auth */
 		rc = add_attr_from_attr_str(name, value,
@@ -1365,4 +1375,16 @@ int ldmsd_msg_gather(struct ldmsd_msg_buf *buf, ldmsd_req_hdr_t req)
 	if (flags & LDMSD_REQ_EOM_F)
 		return 0;
 	return EBUSY;
+}
+
+__attribute__((constructor))
+void __ldmsd_request_util_init()
+{
+	/* make sure the tables are sorted */
+	qsort(req_str_id_table,
+	      sizeof(req_str_id_table)/sizeof(req_str_id_table[0]),
+	      sizeof(req_str_id_table[0]), (void*)req_str_id_cmp);
+	qsort(attr_str_id_table,
+	      sizeof(attr_str_id_table)/sizeof(attr_str_id_table[0]),
+	      sizeof(attr_str_id_table[0]), (void*)req_str_id_cmp);
 }

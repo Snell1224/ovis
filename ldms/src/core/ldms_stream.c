@@ -70,12 +70,14 @@
 
 #include "ovis_json/ovis_json.h"
 #include "coll/rbt.h"
+#include "coll/fnv_hash.h"
 #include "ovis_ref/ref.h"
 #include "ovis_log/ovis_log.h"
 
 #include "ldms.h"
 #include "ldms_rail.h"
 #include "ldms_stream.h"
+#include "ldms_qgroup.h"
 
 static ovis_log_t __ldms_stream_log = NULL; /* see __ldms_stream_init() below */
 
@@ -99,11 +101,16 @@ static ovis_log_t __ldms_stream_log = NULL; /* see __ldms_stream_init() below */
 
 static int __stream_stats_level = 1;
 
+struct __stream_event_s {
+	struct ldms_stream_event_s pub;
+	struct __stream_buf_s *sbuf;
+};
+
 /* see implementation in ldms_rail.c */
-int  __credit_acquire(uint64_t *credit, uint64_t n);
-void __credit_release(uint64_t *credit, uint64_t n);
-int __rate_credit_acquire(struct ldms_rail_rate_credit_s *c, uint64_t n);
-void __rate_credit_release(struct ldms_rail_rate_credit_s *c, uint64_t n);
+int  __quota_acquire(uint64_t *quota, uint64_t n);
+void __quota_release(uint64_t *quota, uint64_t n);
+int __rate_quota_acquire(struct ldms_rail_rate_quota_s *c, uint64_t n);
+void __rate_quota_release(struct ldms_rail_rate_quota_s *c, uint64_t n);
 
 int __str_rbn_cmp(void *tree_key, const void *key);
 int __u64_rbn_cmp(void *tree_key, const void *key);
@@ -220,7 +227,8 @@ static int __part_send(struct ldms_rail_ep_s *rep,
 	return rc;
 }
 
-static int __rep_publish(struct ldms_rail_ep_s *rep, const char *stream_name,
+int __rep_publish(struct ldms_rail_ep_s *rep, const char *stream_name,
+			uint32_t hash,
                         ldms_stream_type_t stream_type,
 			struct ldms_addr *src, uint64_t msg_gn,
 			ldms_cred_t cred, int perm,
@@ -228,19 +236,9 @@ static int __rep_publish(struct ldms_rail_ep_s *rep, const char *stream_name,
 {
 	int rc = 0;
 	int name_len = strlen(stream_name) + 1;
-	int credit_required = name_len + data_len; /* header stuff are not credited */
 	struct ldms_stream_full_msg_s msg;
 
-	rc = __credit_acquire(&rep->send_credit, credit_required);
-	if (rc)
-		return rc;
-	rc = __rate_credit_acquire(&rep->rate_credit, credit_required);
-	if (rc) {
-		__credit_release(&rep->send_credit, credit_required);
-		return rc;
-	}
-
-	/* credit acquired */
+	/* quota already acquired */
 	if (src) {
 		msg.src = *src;
 		msg.src.sa_family = htons(msg.src.sa_family);
@@ -254,6 +252,7 @@ static int __rep_publish(struct ldms_rail_ep_s *rep, const char *stream_name,
 	msg.cred.uid = htobe32(cred->uid);
 	msg.cred.gid = htobe32(cred->gid);
 	msg.perm = htobe32(perm);
+	msg.name_hash = hash;
 	rc = __part_send(rep, &msg.src, msg_gn,
 			 &msg, sizeof(msg), /* msg hdr */
 			 stream_name, name_len, /* name */
@@ -264,13 +263,20 @@ static int __rep_publish(struct ldms_rail_ep_s *rep, const char *stream_name,
 
 static int primer = 1033;
 
+/* Implementation in ldms_rail.c */
+int __rep_flush_sbuf_tq(struct ldms_rail_ep_s *rep);
+
 /* callback function for remote client; republish data to c->x */
 static int
 __remote_client_cb(ldms_stream_event_t ev, void *cb_arg)
 {
+	struct __stream_event_s *_ev = (void*)ev;
+	struct __stream_buf_s *sbuf = _ev->sbuf;
 	ldms_rail_t r;
 	int ep_idx;
 	int rc;
+	uint64_t addr_port;
+	uint64_t hash;
 	if (ev->type == LDMS_STREAM_EVENT_CLOSE)
 		return 0;
 	assert( ev->type == LDMS_STREAM_EVENT_RECV );
@@ -279,35 +285,59 @@ __remote_client_cb(ldms_stream_event_t ev, void *cb_arg)
 	r = (ldms_rail_t)ev->recv.client->x;
 	switch (ev->recv.src.sa_family) {
 	case 0:
-		ep_idx = 0;
+		ep_idx = ( ev->recv.name_hash % primer ) % r->n_eps;
 		break;
 	case AF_INET:
-		ep_idx = ( be32toh(*(int*)&ev->recv.src.addr[0]) % primer ) % r->n_eps;
+		addr_port = be32toh(*(int*)&ev->recv.src.addr[0]);
+		addr_port = (addr_port<<16) | be16toh(ev->recv.src.sin_port);
+		hash = (addr_port << 32) | ev->recv.name_hash;
+		ep_idx = ( hash % primer ) % r->n_eps;
 		break;
 	case AF_INET6:
-		ep_idx = ( be32toh(*(int*)&ev->recv.src.addr[12]) % primer ) % r->n_eps;
+		addr_port = be32toh(*(int*)&ev->recv.src.addr[12]);
+		addr_port = (addr_port<<16) | be16toh(ev->recv.src.sin_port);
+		hash = (addr_port << 32) | ev->recv.name_hash;
+		ep_idx = ( hash % primer ) % r->n_eps;
 		break;
 	default:
 		assert(0 == "Unexpected network family");
 		ep_idx = 0;
 	}
 
+	__rep_flush_sbuf_tq(&r->eps[ep_idx]);
+
 	rc = ldms_access_check(r->eps[ep_idx].ep, LDMS_ACCESS_READ,
 			ev->recv.cred.uid, ev->recv.cred.gid, ev->recv.perm);
 	if (0 != rc)
 		return 0; /* remote has no access; do not forward */
 
-	rc = __rate_credit_acquire(&ev->recv.client->rate_credit, ev->recv.data_len);
+	rc = __rate_quota_acquire(&ev->recv.client->rate_quota, ev->recv.data_len);
 	if (rc)
 		goto out;
 
-	rc = __rep_publish(&r->eps[ep_idx], ev->recv.name, ev->recv.type,
+	rc = __rep_quota_acquire(&r->eps[ep_idx], ev->recv.name_len + ev->recv.data_len);
+	if (rc) {
+		__rate_quota_release(&ev->recv.client->rate_quota, ev->recv.data_len);
+		if (!sbuf) /* we don't queue the local publish */
+			goto out;
+		struct __pending_sbuf_s *e;
+		e = malloc(sizeof(*e));
+		if (e) {
+			e->sbuf = sbuf;
+			ref_get(&sbuf->ref, "pending");
+			TAILQ_INSERT_TAIL(&r->eps[ep_idx].sbuf_tq, e, entry);
+		}
+		goto out;
+	}
+
+	rc = __rep_publish(&r->eps[ep_idx], ev->recv.name,  ev->recv.name_hash,
+			     ev->recv.type,
 			     &ev->recv.src, ev->recv.msg_gn,
 			     &ev->recv.cred, ev->recv.perm,
 			     ev->recv.data,
 			     ev->recv.data_len);
 	if (rc)
-		__rate_credit_release(&ev->recv.client->rate_credit, ev->recv.data_len);
+		__rate_quota_release(&ev->recv.client->rate_quota, ev->recv.data_len);
  out:
 	return rc;
 }
@@ -451,8 +481,9 @@ void  __counters_update(struct ldms_stream_counters_s *ctr,
 /* deliver stream data to all clients */
 /* must NOT hold __stream_mutex */
 static int
-__stream_deliver(struct ldms_addr *src, uint64_t msg_gn,
+__stream_deliver(struct __stream_buf_s *sbuf, uint64_t msg_gn,
 		 const char *stream_name, int name_len,
+		 uint32_t hash,
 		 ldms_stream_type_t stream_type,
 		 ldms_cred_t cred, uint32_t perm,
 		 const char *data, size_t data_len)
@@ -469,25 +500,29 @@ __stream_deliver(struct ldms_addr *src, uint64_t msg_gn,
 		goto out;
 	}
 
-	struct ldms_stream_event_s _ev = {
-		.type = LDMS_STREAM_EVENT_RECV,
-		.recv = {
-			.src = {0},
-			.msg_gn = msg_gn,
-			.type = stream_type,
-			.name_len = name_len,
-			.data_len = data_len,
-			.name = stream_name,
-			.data = data,
-			.cred = *cred,
-			.perm = perm,
-			.json = NULL,
-		}
+	struct __stream_event_s _ev = {
+		.pub = {
+			.type = LDMS_STREAM_EVENT_RECV,
+			.recv = {
+				.src = {0},
+				.msg_gn = msg_gn,
+				.type = stream_type,
+				.name_len = name_len,
+				.data_len = data_len,
+				.name = stream_name,
+				.name_hash = hash,
+				.data = data,
+				.cred = *cred,
+				.perm = perm,
+				.json = NULL,
+			}
+		},
+		.sbuf = sbuf,
 	};
 	json_entity_t json = NULL;
 
-	if (src)
-		_ev.recv.src = *src;
+	if (sbuf)
+		_ev.pub.recv.src = sbuf->msg->src;
 
 	/* update stats */
 	if (__stream_stats_level <= 0)
@@ -497,7 +532,7 @@ __stream_deliver(struct ldms_addr *src, uint64_t msg_gn,
 	__counters_update(&s->rx, &now, data_len);
 	if (__stream_stats_level > 1) {
 		/* stats by src */
-		struct rbn *rbn = rbt_find(&s->src_stats_rbt, &_ev.recv.src);
+		struct rbn *rbn = rbt_find(&s->src_stats_rbt, &_ev.pub.recv.src);
 		struct ldms_stream_src_stats_s *ss;
 		if (rbn) {
 			ss = container_of(rbn, struct ldms_stream_src_stats_s, rbn);
@@ -509,7 +544,7 @@ __stream_deliver(struct ldms_addr *src, uint64_t msg_gn,
 				pthread_rwlock_unlock(&s->rwlock);
 				goto skip_stats;
 			}
-			ss->src = _ev.recv.src;
+			ss->src = _ev.pub.recv.src;
 			rbn_init(&ss->rbn, &ss->src);
 			ss->rx = LDMS_STREAM_COUNTERS_INITIALIZER;
 			rbt_ins(&s->src_stats_rbt, &ss->rbn);
@@ -536,7 +571,7 @@ __stream_deliver(struct ldms_addr *src, uint64_t msg_gn,
 				goto cleanup;
 			}
 			rc = json_parse_buffer(jp, (void*)data, data_len, &json);
-			_ev.recv.json = json;
+			_ev.pub.recv.json = json;
 			json_parser_free(jp);
 			if (rc) {
 				goto cleanup;
@@ -544,9 +579,9 @@ __stream_deliver(struct ldms_addr *src, uint64_t msg_gn,
 		}
 		ref_get(&c->ref, "callback");
 		pthread_rwlock_unlock(&s->rwlock);
-		_ev.recv.client = c;
+		_ev.pub.recv.client = c;
 		/* TODO: Start: Get timing for application's stream handling time. */
-		rc = c->cb_fn(&_ev, c->cb_arg);
+		rc = c->cb_fn(&_ev.pub, c->cb_arg);
 		/* TODO: End: Get timing for application's stream handling time. */
 		if (__stream_stats_level > 0) {
 			pthread_rwlock_wrlock(&c->rwlock);
@@ -797,7 +832,10 @@ int ldms_stream_publish(ldms_t x, const char *stream_name,
 	uint64_t msg_gn;
 	int name_len = strlen(stream_name) + 1;
 	struct ldms_cred _cred;
+	uint64_t q;
 	int rc;
+	uint32_t hash;
+	int ep_idx;
 
 	msg_gn = __atomic_fetch_add(&stream_gn, 1, __ATOMIC_SEQ_CST);
 
@@ -814,18 +852,27 @@ int ldms_stream_publish(ldms_t x, const char *stream_name,
 		cred = &_cred;
 	}
 
+	hash = fnv_hash_a1_32(stream_name, strlen(stream_name), FNV_32_PRIME);
+
 	/* publish directly to remote peer */
 	if (x) {
 		if (!XTYPE_IS_RAIL(x->xtype))
 			return ENOTSUP;
 		r = (ldms_rail_t)x;
-		return __rep_publish(&r->eps[0], stream_name, stream_type, 0,
-				     msg_gn, cred, perm, data, data_len);
+		ep_idx = ( hash % primer ) % r->n_eps;
+		__rep_flush_sbuf_tq(&r->eps[ep_idx]);
+		q = strlen(stream_name) + 1 + data_len;
+		rc = __rep_quota_acquire(&r->eps[ep_idx], q);
+		if (rc)
+			return rc;
+		return __rep_publish(&r->eps[ep_idx], stream_name, hash,
+				stream_type, 0, msg_gn, cred, perm, data,
+				data_len);
 	}
 
 	/* else publish locally */
-	return __stream_deliver(0, msg_gn, stream_name, name_len, stream_type,
-				   cred, perm, data, data_len);
+	return __stream_deliver(0, msg_gn, stream_name, name_len, hash,
+				stream_type, cred, perm, data, data_len);
 }
 
 static void __client_ref_free(void *arg)
@@ -927,10 +974,10 @@ __client_alloc(const char *stream, int is_regex,
 	LDMS_STREAM_COUNTERS_INIT(&c->tx);
 	LDMS_STREAM_COUNTERS_INIT(&c->drops);
 
-	c->rate_credit.credit = __RAIL_UNLIMITED;
-	c->rate_credit.rate   = __RAIL_UNLIMITED;
-	c->rate_credit.ts.tv_sec  = 0;
-	c->rate_credit.ts.tv_nsec = 0;
+	c->rate_quota.quota = LDMS_UNLIMITED;
+	c->rate_quota.rate   = LDMS_UNLIMITED;
+	c->rate_quota.ts.tv_sec  = 0;
+	c->rate_quota.ts.tv_nsec = 0;
 
 	goto out;
  err_0:
@@ -1057,11 +1104,6 @@ int ldms_stream_remote_unsubscribe(ldms_t x, const char *match, int is_regex,
 	return __remote_sub(x, LDMS_CMD_STREAM_UNSUB, match, is_regex, cb_fn, cb_arg, -1);
 }
 
-struct __sbuf_key_s {
-	struct ldms_addr src;
-	uint64_t msg_gn;
-};
-
 int __stream_buf_cmp(void *tree_key, const void *key)
 {
 	return memcmp(tree_key, key, sizeof(struct __sbuf_key_s));
@@ -1088,19 +1130,29 @@ int __ldms_addr_rbn_cmp(void *tree_key, const void *key)
 	return memcmp(tree_key, key, sizeof(struct ldms_addr));
 }
 
-struct __stream_buf_s {
-	struct rbn rbn;
-	struct __sbuf_key_s key;
-	size_t full_msg_len;
-	off_t  off;
-	union {
-		struct ldms_stream_full_msg_s msg[0];
-		char buf[0];
-	};
-};
+static void __stream_buf_s_ref_free(void *arg)
+{
+	struct __stream_buf_s *sbuf = arg;
+	struct ldms_rail_ep_s *rep = sbuf->rep;
+	uint64_t q = sbuf->msg->msg_len;
+	int rc, v, cond;
 
-/* implementation in ldms_rail.c */
-void __rail_ep_credit_return(struct ldms_rail_ep_s *rep, int credit);
+	if (0 == ldms_qgroup_quota_acquire(q)) {
+		__rail_ep_quota_return(rep, q);
+	} else {
+		__atomic_fetch_add(&rep->pending_ret_quota, q, __ATOMIC_SEQ_CST);
+		v = 0;
+		cond = __atomic_compare_exchange_n(&rep->in_eps_stq, &v, 1, 0,
+				__ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+		if (cond) {
+			rc = ldms_qgroup_add_rep(rep);
+			if (rc) {
+				__atomic_store_n(&rep->in_eps_stq, 0, __ATOMIC_SEQ_CST);
+			}
+		}
+	}
+	free(arg);
+}
 
 static void
 __process_stream_msg(ldms_t x, struct ldms_request *req)
@@ -1114,10 +1166,6 @@ __process_stream_msg(ldms_t x, struct ldms_request *req)
 	union ldms_sockaddr lsa, rsa;
 	socklen_t slen = sizeof(lsa);
 	int rc;
-	const char *name;
-	int name_len;
-	const char *data;
-	int data_len;
 
 	/* src is always big endian */
 	req->stream_part.msg_gn = be64toh(req->stream_part.msg_gn);
@@ -1174,12 +1222,15 @@ __process_stream_msg(ldms_t x, struct ldms_request *req)
 	sbuf = malloc(sizeof(*sbuf) + sizeof(*fmsg) + flen);
 	if (!sbuf)
 		return;
+	ref_init(&sbuf->ref, "init", __stream_buf_s_ref_free, sbuf);
 	sbuf->full_msg_len = flen + sizeof(*fmsg);
 	sbuf->key.src = req->stream_part.src;
 	sbuf->key.msg_gn = req->stream_part.msg_gn;
 	rbn_init(&sbuf->rbn, &sbuf->key);
 	sbuf->off = 0;
 	rbt_ins(&rep->sbuf_rbt, &sbuf->rbn);
+	ref_get(&sbuf->ref, "rbt");
+	sbuf->rep = rep;
  collect:
 	if (plen + sbuf->off > sbuf->full_msg_len) {
 		assert(0 == "Bad message length");
@@ -1204,21 +1255,23 @@ __process_stream_msg(ldms_t x, struct ldms_request *req)
 	sbuf->msg->cred.uid = be32toh(sbuf->msg->cred.uid);
 	sbuf->msg->cred.gid = be32toh(sbuf->msg->cred.gid);
 	sbuf->msg->perm = be32toh(sbuf->msg->perm);
+	/* sbuf->msg->name_hash does not need byte conversion */
 
-	name = sbuf->msg->msg;
-	name_len = strlen(name)+1;
-	data = sbuf->msg->msg + name_len;
-	data_len = sbuf->msg->msg_len - name_len;
+	sbuf->name = sbuf->msg->msg;
+	sbuf->name_len = strlen(sbuf->name)+1;
+	sbuf->data = sbuf->msg->msg + sbuf->name_len;
+	sbuf->data_len = sbuf->msg->msg_len - sbuf->name_len;
 
-	__stream_deliver(&sbuf->msg->src, sbuf->msg->msg_gn,
-			 name, name_len, sbuf->msg->stream_type,
+	__stream_deliver(sbuf, sbuf->msg->msg_gn,
+			 sbuf->name, sbuf->name_len, sbuf->msg->name_hash,
+			 sbuf->msg->stream_type,
 			 &sbuf->msg->cred, sbuf->msg->perm,
-			 data, data_len);
-	__rail_ep_credit_return(rep, name_len + data_len);
+			 sbuf->data, sbuf->data_len);
 
  cleanup:
 	rbt_del(&rep->sbuf_rbt, &sbuf->rbn);
-	free(sbuf);
+	ref_put(&sbuf->ref, "rbt");
+	ref_put(&sbuf->ref, "init");
 }
 
 static void
@@ -1257,8 +1310,8 @@ __process_stream_sub(ldms_t x, struct ldms_request *req)
 		goto reply;
 	}
 
-	c->rate_credit.rate = be64toh(req->stream_sub.rate);
-	c->rate_credit.credit = be64toh(req->stream_sub.rate);
+	c->rate_quota.rate = be64toh(req->stream_sub.rate);
+	c->rate_quota.quota = be64toh(req->stream_sub.rate);
 
 	rc = ldms_xprt_sockaddr(x, &lsin.sa, &rsin.sa, &sin_len);
 	if (!rc) {

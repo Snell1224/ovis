@@ -1677,10 +1677,13 @@ int __ldms_remote_update(ldms_t x, ldms_set_t s, ldms_update_cb_t cb, void *arg)
 	return rc;
 }
 
-void __rail_process_send_credit(ldms_t x, struct ldms_request *req);
+void __rail_process_send_quota(ldms_t x, struct ldms_request *req);
+void __rail_process_quota_reconfig(ldms_t x, struct ldms_request *req);
+void __rail_process_rate_reconfig(ldms_t x, struct ldms_request *req);
 
 /* implementation is in ldms_stream.c */
 void __stream_req_recv(ldms_t x, int cmd, struct ldms_request *req);
+void __qgroup_req_recv(ldms_t x, int cmd, struct ldms_request *req);
 
 enum ldms_thrstat_op_e req2thrstat_op_tbl[];
 static
@@ -1725,13 +1728,24 @@ int ldms_xprt_recv_request(struct ldms_xprt *x, struct ldms_request *req)
 	case LDMS_CMD_SET_DELETE:
 		process_set_delete_request(x, req);
 		break;
-	case LDMS_CMD_SEND_CREDIT:
-		__rail_process_send_credit(x, req);
+	case LDMS_CMD_SEND_QUOTA:
+		__rail_process_send_quota(x, req);
 		break;
 	case LDMS_CMD_STREAM_MSG:
 	case LDMS_CMD_STREAM_SUB:
 	case LDMS_CMD_STREAM_UNSUB:
 		__stream_req_recv(x, cmd, req);
+		break;
+	case LDMS_CMD_QGROUP_ASK:
+	case LDMS_CMD_QGROUP_DONATE:
+	case LDMS_CMD_QGROUP_DONATE_BACK:
+		__qgroup_req_recv(x, cmd, req);
+		break;
+	case LDMS_CMD_QUOTA_RECONFIG:
+		__rail_process_quota_reconfig(x, req);
+		break;
+	case LDMS_CMD_RATE_RECONFIG:
+		__rail_process_rate_reconfig(x, req);
 		break;
 	default:
 		XPRT_LOG(x, OVIS_LERROR, "Unrecognized request %d\n", cmd);
@@ -2283,7 +2297,7 @@ int ldms_xprt_names(ldms_t x, char *lcl_name, size_t lcl_name_sz,
 	}
 
 	if (rem_name || rem_port) {
-		(void)getnameinfo((void*)&lcl, xlen, rem_name, rem_name_sz,
+		(void) getnameinfo((void*)&rmt, xlen, rem_name, rem_name_sz,
 					rem_port, rem_port_sz, flags);
 	}
 	return 0;
@@ -4112,7 +4126,7 @@ static void sync_connect_cb(ldms_t x, ldms_xprt_event_t e, void *cb_arg)
 		break;
 	case LDMS_XPRT_EVENT_SET_DELETE:
 	case LDMS_XPRT_EVENT_SEND_COMPLETE:
-	case LDMS_XPRT_EVENT_SEND_CREDIT_DEPOSITED:
+	case LDMS_XPRT_EVENT_SEND_QUOTA_DEPOSITED:
 		/* Don't post */
 		return;
 	default:
@@ -4244,6 +4258,8 @@ static int __ldms_xprt_sockaddr(ldms_t x, struct sockaddr *local_sa,
 		       socklen_t *sa_len)
 {
 	zap_err_t zerr;
+	if (!x->zap_ep)
+		return ENOTCONN;
 	zerr = zap_get_name(x->zap_ep, (struct sockaddr *)local_sa,
 				(struct sockaddr *)remote_sa, sa_len);
 	return zap_zerr2errno(zerr);
@@ -4317,7 +4333,7 @@ enum ldms_thrstat_op_e req2thrstat_op_tbl[] = {
 	[LDMS_CMD_CANCEL_PUSH]        = LDMS_THRSTAT_OP_OTHER ,
 	[LDMS_CMD_AUTH]               = LDMS_THRSTAT_OP_AUTH ,
 	[LDMS_CMD_SET_DELETE]         = LDMS_THRSTAT_OP_SET_DELETE_REQ ,
-	[LDMS_CMD_SEND_CREDIT]        = LDMS_THRSTAT_OP_OTHER ,
+	[LDMS_CMD_SEND_QUOTA]         = LDMS_THRSTAT_OP_OTHER ,
 
 	[LDMS_CMD_DIR_REPLY]          = LDMS_THRSTAT_OP_DIR_REPLY ,
 	[LDMS_CMD_DIR_UPDATE_REPLY]   = LDMS_THRSTAT_OP_UPDATE_REPLY ,

@@ -121,12 +121,22 @@ enum ldms_request_cmd {
 	LDMS_CMD_CANCEL_PUSH,
 	LDMS_CMD_AUTH,
 	LDMS_CMD_SET_DELETE,
-	LDMS_CMD_SEND_CREDIT, /* for updaing send credit */
+	LDMS_CMD_SEND_QUOTA, /* for updaing send quota */
 
 	/* stream requests */
 	LDMS_CMD_STREAM_MSG, /* for stream messages */
 	LDMS_CMD_STREAM_SUB, /* stream subscribe request */
 	LDMS_CMD_STREAM_UNSUB, /* stream subscribe request */
+
+	/* qgroup messages */
+	LDMS_CMD_QGROUP_ASK,
+	LDMS_CMD_QGROUP_DONATE,
+	LDMS_CMD_QGROUP_DONATE_BACK,
+
+	/* rail quota re-config after connected */
+	LDMS_CMD_QUOTA_RECONFIG,
+	/* rail rate re-config after connected */
+	LDMS_CMD_RATE_RECONFIG,
 
 	LDMS_CMD_REPLY = 0x100,
 	LDMS_CMD_DIR_REPLY,
@@ -169,8 +179,8 @@ struct ldms_send_cmd_param {
 	char msg[OVIS_FLEX];
 };
 
-struct ldms_send_credit_param {
-	uint32_t send_credit;
+struct ldms_send_quota_param {
+	uint32_t send_quota;
 };
 
 struct ldms_lookup_cmd_param {
@@ -219,6 +229,24 @@ struct ldms_stream_sub_param {
 	char match[OVIS_FLEX];
 };
 
+struct ldms_qgroup_ask {
+	uint64_t q;
+	uint64_t usec; /* like 'sec' since epoch, but in usec */
+};
+
+struct ldms_qgroup_donate {
+	uint64_t q;
+	uint64_t usec; /* like 'sec' since epoch, but in usec */
+};
+
+struct ldms_quota_reconfig_param {
+	uint64_t q; /* the new quota */
+};
+
+struct ldms_rate_reconfig_param {
+	uint64_t rate; /* the new rate (bytes/sec) */
+};
+
 struct ldms_request_hdr {
 	uint64_t xid;		/*! Transaction id returned in reply */
 	uint32_t cmd;		/*! The operation being requested  */
@@ -229,7 +257,7 @@ struct ldms_request {
 	struct ldms_request_hdr hdr;
 	union {
 		struct ldms_send_cmd_param send;
-		struct ldms_send_credit_param send_credit;
+		struct ldms_send_quota_param send_quota;
 		struct ldms_dir_cmd_param dir;
 		struct ldms_set_delete_cmd_param set_delete;
 		struct ldms_lookup_cmd_param lookup;
@@ -238,6 +266,10 @@ struct ldms_request {
 		struct ldms_cancel_push_cmd_param cancel_push;
 		struct ldms_stream_part_msg_param stream_part;
 		struct ldms_stream_sub_param stream_sub;
+		struct ldms_qgroup_ask qgroup_ask;
+		struct ldms_qgroup_donate  qgroup_donate;
+		struct ldms_quota_reconfig_param quota_reconfig;
+		struct ldms_rate_reconfig_param rate_reconfig;
 	};
 };
 
@@ -400,6 +432,12 @@ typedef enum ldms_xtype_e {
 #define XTYPE_IS_PASSIVE(t) ((t) & 0x1)
 #define XTYPE_IS_LEGACY(t) (((t) & (~0x1)) == 0)
 #define XTYPE_IS_RAIL(t) ((t) & 0x2)
+
+#define LDMS_IS_RAIL(x) XTYPE_IS_RAIL((x)->xtype)
+#define LDMS_IS_LEGACY(x) XTYPE_IS_LEGACY((x)->xtype)
+#define LDMS_IS_PASSIVE(x) XTYPE_IS_PASSIVE((x)->xtype)
+
+#define LDMS_RAIL(x) ((ldms_rail_t)(x))
 
 struct ldms_xprt_ops_s {
 	int (*connect)(ldms_t x, struct sockaddr *sa, socklen_t sa_len,
