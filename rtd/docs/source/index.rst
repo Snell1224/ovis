@@ -10,7 +10,7 @@
 
 Welcome To OVIS-HPC Documentation!
 ====================================
-.. image:: images/ovis-logo.png
+.. image:: https://github.com/ovis-hpc/readthedocs/blob/main/docs/source/images/ovis-logo.png?raw=true
    :width: 225
    :height: 250
    :align: center
@@ -46,7 +46,7 @@ Welcome To OVIS-HPC Documentation!
    Baler <https://ovis-hpc.readthedocs.io/projects/baler/en/latest/deployment/index.html>
    ASF <asf/deployment/index>
 
-   
+
 Other Projects
 ====================================
 
@@ -56,7 +56,7 @@ Other Projects
 `sos <https://github.com/ovis-hpc/sos>`_
 `baler <https://github.com/ovis-hpc/baler>`_
 
-   
+
 
 
 
